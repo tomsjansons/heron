@@ -1574,6 +1574,7 @@ dependencies = [
  "jiff",
  "serde_json",
  "tokio",
+ "toml",
 ]
 
 [[package]]

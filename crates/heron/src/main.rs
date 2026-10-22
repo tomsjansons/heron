@@ -1,6 +1,8 @@
 //! heron: CLI for herond. Talks to the daemon over its socket, and runs the
 //! interactive logins that store credentials for it.
 
+mod init;
+
 use std::io::IsTerminal;
 
 use anyhow::{Context, Result};
@@ -18,6 +20,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Create the config file by answering a few questions.
+    Init {
+        /// Overwrite an existing config.
+        #[arg(long)]
+        force: bool,
+    },
     /// Show counts, upcoming events and source health.
     Status {
         /// Print the raw snapshot as one JSON line.
@@ -57,6 +65,7 @@ enum AuthProvider {
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().command {
+        Command::Init { force } => init::run(force)?,
         Command::Status { json } => {
             let line = request_one(&Request::Status).await?;
             if json {

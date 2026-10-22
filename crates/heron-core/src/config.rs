@@ -105,6 +105,11 @@ impl Default for CalendarSettings {
     }
 }
 
+/// Points at `heron init` when there is no config file yet.
+fn init_hint() -> &'static str {
+    if paths::config_file().exists() { "" } else { " (no config yet: run `heron init`)" }
+}
+
 fn yes() -> bool {
     true
 }
@@ -139,11 +144,11 @@ impl Config {
 
     pub fn google_account(&self, id: &str) -> Result<&GoogleAccount> {
         self.google.iter().find(|a| a.id == id)
-            .with_context(|| format!("no [[google]] account with id {id:?} in {}", paths::config_file().display()))
+            .with_context(|| format!("no [[google]] account with id {id:?} in {}{}", paths::config_file().display(), init_hint()))
     }
 
     pub fn proton_account(&self, id: &str) -> Result<&ProtonAccount> {
         self.proton.iter().find(|a| a.id == id)
-            .with_context(|| format!("no [[proton]] account with id {id:?} in {}", paths::config_file().display()))
+            .with_context(|| format!("no [[proton]] account with id {id:?} in {}{}", paths::config_file().display(), init_hint()))
     }
 }

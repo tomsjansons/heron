@@ -49,8 +49,8 @@ acknowledgements `~/.local/state/heron/acks.json`.
 cargo install --path crates/herond
 cargo install --path crates/heron
 
-mkdir -p ~/.config/heron
-cp contrib/config.example.toml ~/.config/heron/config.toml   # then edit
+
+heron init                    # asks a few questions, writes ~/.config/heron/config.toml
 
 heron auth google personal    # browser OAuth; see crates/heron-google/src/lib.rs for the Cloud setup
 heron auth proton proton      # password, TOTP, mailbox password if two-password mode
