@@ -60,9 +60,31 @@ end
 
 -- ── Command and actions ──────────────────────────────────────────────────────
 
+-- Where `cargo install` and friends put binaries, which the shell's PATH often
+-- lacks. Tried in order when a bare command name is not on PATH.
+local FALLBACK_DIRS = { "/.cargo/bin/", "/.local/bin/" }
+
+-- A bare name that is not on PATH, resolved against FALLBACK_DIRS under $HOME.
+local function resolve(command)
+  if string.find(command, "/", 1, true) or noctalia.commandExists(command) then
+    return command
+  end
+  local home = noctalia.getenv("HOME")
+  if home then
+    for _, dir in FALLBACK_DIRS do
+      local path = home .. dir .. command
+      if noctalia.fileExists(path) then
+        return path
+      end
+    end
+  end
+  return command
+end
+
 -- The heron executable: the IPC override, else the plugin setting, else "heron".
 -- A leading "~/" is expanded by hand; noctalia.expandPath would turn a bare
--- name into a plugin-relative path.
+-- name into a plugin-relative path. A bare name falls back to ~/.cargo/bin
+-- and ~/.local/bin when it is not on PATH.
 function M.command()
   local command = noctalia.state.get(M.COMMAND_KEY)
   if type(command) ~= "string" or M.trim(command) == "" then
@@ -75,7 +97,7 @@ function M.command()
   if string.sub(command, 1, 2) == "~/" then
     command = (noctalia.getenv("HOME") or "~") .. string.sub(command, 2)
   end
-  return command
+  return resolve(command)
 end
 
 -- Runs `heron <args...>`. Failures raise an error notification; onDone, when
