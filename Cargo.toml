@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/heron-core", "crates/herond", "crates/heron"]
+members = ["crates/heron-core", "crates/heron-proton", "crates/heron-google", "crates/heron-discord", "crates/herond", "crates/heron"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,10 +10,13 @@ repository = "https://github.com/tomsjansons/heron"
 
 [workspace.dependencies]
 heron-core = { path = "crates/heron-core" }
+heron-proton = { path = "crates/heron-proton" }
+heron-google = { path = "crates/heron-google" }
+heron-discord = { path = "crates/heron-discord" }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal", "fs", "time", "process"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
