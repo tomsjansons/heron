@@ -1,0 +1,14 @@
+[Unit]
+Description=heron mail, calendar and Discord sync
+Documentation=https://github.com/tomsjansons/heron
+After=network-online.target graphical-session.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%h/.cargo/bin/herond
+ExecReload=%h/.cargo/bin/heron reload
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

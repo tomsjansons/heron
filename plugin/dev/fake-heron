@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+# fake-heron: a stand-in for the `heron` CLI, for developing the Noctalia plugin
+# without a running herond.
+#
+#   fake-heron watch                 snapshot now, then on every change
+#   fake-heron status --json         one snapshot
+#   fake-heron ack [account]         clear "new"
+#   fake-heron mark-read ACCT ID     \  persisted in $XDG_RUNTIME_DIR/fake-heron.json,
+#   fake-heron mark-unread ACCT ID   /  so the plugin's actions round-trip
+#   fake-heron reload                prints nothing, exits 0
+#
+# Every 20 seconds after the first run a new message arrives, five in total. Delete
+# $XDG_RUNTIME_DIR/fake-heron.json to start over.
+# Touch $XDG_RUNTIME_DIR/fake-heron.down to simulate a stopped daemon: running
+# watches exit and new ones fail the way the real CLI does. Remove it to recover.
+# Every invocation is logged to $XDG_RUNTIME_DIR/fake-heron.log (retry timing,
+# which actions the plugin ran).
+#
+# Point the plugin at it without touching settings:
+#   noctalia msg plugin toms/heron:sync all command "$PWD/plugin/dev/fake-heron"
+
+import json
+import os
+import sys
+import time
+
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+STATE = os.path.join(RUNTIME, "fake-heron.json")
+DOWN = os.path.join(RUNTIME, "fake-heron.down")
+LOG = os.path.join(RUNTIME, "fake-heron.log")
+ARRIVAL_SECONDS = 20
+
+ARRIVALS = [
+    ("Ana Ruiz", "Q3 roadmap: final sign-off needed"),
+    ("GitHub", "[heron] PR #12 ready for review"),
+    ("Grafana Alerts", "Firing: api-latency-p99 above 800ms"),
+    ("Lena Fischer", "Design handoff for the inbox panel"),
+    ("Stripe", "Payout of EUR 4,120.00 is on the way"),
+]
+
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {"read": [], "unread": [], "acked": {}, "started": int(time.time())}
+
+
+def save_state(state):
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, STATE)
+
+
+def base_messages(now):
+    return {
+        "personal": ("gmail", [
+            ("m1", "Marcin Kowalski", "Re: staging DB migration window", now - 25 * 60),
+            ("m2", "Hetzner", "Server maintenance on 2026-10-30", now - 3 * 3600),
+            ("m3", "Priya Nair", "Interview debrief: backend candidate", now - 26 * 3600),
+            ("m4", "AWS Billing", "Your invoice for September is available", now - 4 * 86400),
+        ]),
+        "proton": ("proton", [
+            ("p1", "Daniel Okafor", "Contract renewal, need your signature", now - 8 * 60),
+            ("p2", "Sofia Marchetti", "Invoice #2291 attached", now - 5 * 3600),
+        ]),
+    }
+
+
+def build(state):
+    now = int(time.time())
+    accounts = base_messages(state["started"])
+    # Messages that "arrived" while watching land in the proton account.
+    arrived = min(len(ARRIVALS), max(0, (now - state["started"]) // ARRIVAL_SECONDS))
+    for i in range(arrived):
+        sender, subject = ARRIVALS[i]
+        received = state["started"] + (i + 1) * ARRIVAL_SECONDS
+        accounts["proton"][1].insert(0, ("a%d" % i, sender, subject, received))
+
+    read = set(state["read"])
+    forced_unread = set(state["unread"])
+    mail = []
+    total_new = total_unread = 0
+    for account, (provider, rows) in accounts.items():
+        acked = state["acked"].get(account, state["started"] - 600)
+        messages = []
+        for mid, sender, subject, received in rows:
+            key = account + "/" + mid
+            unread = key not in read or key in forced_unread
+            new = unread and received > acked
+            messages.append({
+                "id": mid, "from": sender, "subject": subject, "received": received,
+                "unread": unread, "new": new,
+                "url": "https://mail.example.com/%s/%s" % (account, mid),
+            })
+        messages.sort(key=lambda m: -m["received"])
+        new = sum(1 for m in messages if m["new"])
+        unread = sum(1 for m in messages if m["unread"])
+        total_new += new
+        total_unread += unread
+        mail.append({"id": account, "provider": provider, "new": new, "unread": unread,
+                     "messages": [m for m in messages if m["unread"]] + [m for m in messages if not m["unread"]][:2]})
+
+    lt = time.localtime(now)
+    midnight = int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1)))
+    started = state["started"]
+    soon = started - started % 60 + 9 * 60  # inside the 10 minute reminder window
+    calendar = [
+        {"id": "ev-ongoing-%d" % started, "source": "personal", "calendar": "Work", "title": "Focus block",
+         "location": None, "start": started - 20 * 60, "end": started + 5 * 60, "all_day": False,
+         "color": "#7986cb", "url": "https://calendar.example.com/ev-ongoing"},
+        {"id": "ev-soon-%d" % started, "source": "personal", "calendar": "Work", "title": "Standup",
+         "location": "Meet", "start": soon, "end": soon + 15 * 60, "all_day": False,
+         "color": "#7986cb", "url": "https://meet.example.com/abc-defg-hij"},
+        {"id": "ev-later", "source": "proton", "calendar": "Personal", "title": "Dentist",
+         "location": "Brivibas iela 1, Riga", "start": started + 3 * 3600, "end": started + 4 * 3600,
+         "all_day": False, "color": "#e67c73", "url": None},
+        {"id": "ev-allday", "source": "personal", "calendar": "Birthdays", "title": "Jonas' birthday",
+         "location": None, "start": midnight + 86400, "end": midnight + 2 * 86400, "all_day": True,
+         "color": "#33b679", "url": None},
+        {"id": "ev-tomorrow", "source": "personal", "calendar": "Work", "title": "Quarterly planning",
+         "location": "Room 4", "start": midnight + 86400 + 10 * 3600, "end": midnight + 86400 + 12 * 3600,
+         "all_day": False, "color": "#7986cb", "url": "https://calendar.example.com/ev-tomorrow"},
+        {"id": "ev-week", "source": "proton", "calendar": "Personal", "title": "Flight to Berlin",
+         "location": "RIX", "start": midnight + 3 * 86400 + 7 * 3600, "end": midnight + 3 * 86400 + 9 * 3600,
+         "all_day": False, "color": "#e67c73", "url": None},
+    ]
+    calendar.sort(key=lambda e: e["start"])
+
+    tick = (now - state["started"]) // ARRIVAL_SECONDS
+    channels = [
+        {"id": "c1", "name": "general", "mentions": 2, "url": "https://discord.com/channels/1/c1"},
+        {"id": "c2", "name": "heron-dev", "mentions": 0, "url": "https://discord.com/channels/1/c2"},
+        {"id": "c3", "name": "off-topic", "mentions": 0, "url": "https://discord.com/channels/1/c3"},
+    ]
+    if tick % 2 == 1:
+        channels.append({"id": "c4", "name": "announcements", "mentions": 1,
+                         "url": "https://discord.com/channels/1/c4"})
+    channels.sort(key=lambda c: -c["mentions"])
+    discord = {"id": "1", "name": "Rustaceans", "unread_channels": len(channels),
+               "mentions": sum(c["mentions"] for c in channels), "channels": channels}
+
+    sources = [
+        {"id": "personal", "kind": "gmail", "state": "ok", "message": None},
+        {"id": "personal", "kind": "google_calendar", "state": "ok", "message": None},
+        {"id": "proton", "kind": "proton_mail", "state": "ok", "message": None},
+        {"id": "work", "kind": "gmail", "state": "needs_auth", "message": None},
+        {"id": "proton", "kind": "proton_calendar", "state": "error", "message": "event loop: 503, retrying in 30s"},
+        {"id": "discord", "kind": "discord", "state": "ok", "message": None},
+    ]
+
+    return {"type": "snapshot", "new": total_new, "unread": total_unread, "mail": mail,
+            "calendar": calendar, "discord": discord, "sources": sources}
+
+
+def daemon_down():
+    print("Error: herond is not running (no socket at %s/heron.sock)" % RUNTIME, file=sys.stderr)
+    sys.exit(1)
+
+
+def watch():
+    if os.path.exists(DOWN):
+        daemon_down()
+    save_state(load_state())  # pins "started" for the arrivals below
+    last = None
+    while True:
+        if os.path.exists(DOWN):
+            return  # the daemon closed the connection
+        line = json.dumps(build(load_state()), separators=(",", ":"))
+        # Times inside the snapshot move every second; only re-emit on a real change.
+        signature = json.dumps(json.loads(line)["mail"]) + json.dumps(json.loads(line)["discord"])
+        if signature != last:
+            print(line, flush=True)
+            last = signature
+        time.sleep(1)
+
+
+def main(argv):
+    with open(LOG, "a") as f:
+        f.write("%s %s\n" % (time.strftime("%H:%M:%S"), " ".join(argv)))
+    if not argv:
+        print("usage: fake-heron watch|status --json|ack|mark-read|mark-unread|reload", file=sys.stderr)
+        return 2
+    cmd, args = argv[0], argv[1:]
+    if cmd == "watch":
+        watch()
+        return 0
+    if os.path.exists(DOWN):
+        daemon_down()
+    state = load_state()
+    if cmd == "status":
+        print(json.dumps(build(state)))
+    elif cmd == "ack":
+        now = int(time.time())
+        for account in ([args[0]] if args else ["personal", "proton"]):
+            state["acked"][account] = now
+    elif cmd in ("mark-read", "mark-unread") and len(args) == 2:
+        key = args[0] + "/" + args[1]
+        read, unread = set(state["read"]), set(state["unread"])
+        if cmd == "mark-read":
+            read.add(key)
+            unread.discard(key)
+        else:
+            read.discard(key)
+            unread.add(key)
+        state["read"], state["unread"] = sorted(read), sorted(unread)
+    elif cmd == "reload":
+        pass
+    else:
+        print("fake-heron: unsupported: %s" % " ".join(argv), file=sys.stderr)
+        return 2
+    save_state(state)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,88 @@
+# heron: mail, calendar and Discord unread state from herond in the bar.
+#
+# One [[service]] (`sync`) holds `heron watch` open and republishes every
+# snapshot on the "heron" noctalia.state key. The bar widgets and panels are
+# thin clients of that value; they shell out to `heron` only for actions
+# (ack, mark-read, mark-unread) and to `xdg-open` for links.
+#
+# plugin_api 24: require() modules (22) and the argv form of runAsync (24),
+# which also covers timeFormat (19) and nowMs (12).
+
+id           = "toms/heron"
+name         = "Heron"
+version      = "0.1.0"
+plugin_api   = 24
+author       = "toms"
+license      = "GPL-3.0-only"
+icon         = "mail"
+description  = "Mail, calendar and Discord unread state from the heron daemon."
+tags         = ["bar", "panel"]
+dependencies = ["heron", "xdg-open"]
+
+[[setting]]
+key             = "heron_command"
+type            = "string"
+label_key       = "settings.heron_command.label"
+description_key = "settings.heron_command.description"
+default         = "heron"
+
+[[setting]]
+key             = "notify_mail"
+type            = "bool"
+label_key       = "settings.notify_mail.label"
+description_key = "settings.notify_mail.description"
+default         = true
+
+[[setting]]
+key             = "reminder_minutes"
+type            = "int"
+label_key       = "settings.reminder_minutes.label"
+description_key = "settings.reminder_minutes.description"
+default         = 10
+min             = 0
+max             = 120
+
+# Headless: runs `heron watch`, publishes state, retries with backoff, notifies.
+[[service]]
+id    = "sync"
+entry = "sync.luau"
+
+# "(N) new; (M) unread". Click toggles the inbox panel.
+[[widget]]
+id    = "mail"
+entry = "mail.luau"
+
+# "14:00 Standup" / "now · Standup". Click toggles the calendar panel.
+[[widget]]
+id    = "agenda"
+entry = "agenda.luau"
+
+# Unread channel count, "@N" with mentions. Click toggles the channels panel,
+# right click opens the server.
+[[widget]]
+id    = "discord"
+entry = "discord.luau"
+
+[[panel]]
+id              = "inbox"
+entry           = "inbox.luau"
+width           = 600
+height          = 460
+placement       = "attached"
+open_near_click = true
+
+[[panel]]
+id              = "calendar"
+entry           = "calendar.luau"
+width           = 480
+height          = 480
+placement       = "attached"
+open_near_click = true
+
+[[panel]]
+id              = "channels"
+entry           = "channels.luau"
+width           = 380
+height          = 400
+placement       = "attached"
+open_near_click = true

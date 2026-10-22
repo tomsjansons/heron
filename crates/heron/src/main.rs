@@ -193,9 +193,10 @@ fn print_status(snapshot: &Snapshot) {
     if !problems.is_empty() {
         println!("\n{}", style.bold("Sources"));
         for source in problems {
-            let hint = match source.state {
-                SourceState::NeedsAuth => "login required, run `heron auth`".to_owned(),
-                _ => source.message.clone().unwrap_or_default(),
+            let hint = match (&source.message, source.state) {
+                (Some(message), _) => message.clone(),
+                (None, SourceState::NeedsAuth) => "login required, run `heron auth`".to_owned(),
+                (None, _) => String::new(),
             };
             println!("  {:<12} {:?} {:?}  {}", source.id, source.kind, source.state, style.dim(&hint));
         }

@@ -11,3 +11,12 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "query", "http2"] }
+base64 = "0.22"
+rpassword = "7"
+rrule = "0.14"
+chrono-tz = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+proton-srp = "0.8"
+# Pure-Rust rPGP backend; the default `gopgp` backend needs Go/cgo.
+proton-crypto-account = { version = "0.20", default-features = false, features = ["rustpgp"] }

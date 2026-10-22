@@ -1,0 +1,34 @@
+# ~/.config/heron/config.toml
+#
+# Account ids appear in the shell, in `heron auth <provider> <id>` and in
+# credential file names. Letters, digits, '-' and '_' only.
+
+# Desktop OAuth client from Google Cloud, shared by every Google account.
+# See crates/heron-google for the setup steps.
+[google_client]
+client_id = "1234567890-abc.apps.googleusercontent.com"
+client_secret = "GOCSPX-..."
+
+[[google]]
+id = "personal"
+email = "me@gmail.com"
+
+[[google]]
+id = "work"
+email = "me@company.com"
+mail = false                  # calendar only
+# calendars = ["primary"]     # default: calendars ticked in Google Calendar
+
+[[proton]]
+id = "proton"
+username = "me@proton.me"
+
+[discord]
+guild_id = "123456789012345678"
+
+[mail]
+max_messages = 50
+
+[calendar]
+days_ahead = 7
+poll_secs = 300

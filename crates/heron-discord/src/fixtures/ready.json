@@ -1,0 +1,109 @@
+{
+  "v": 9,
+  "session_id": "abc123",
+  "resume_gateway_url": "wss://gateway-us-east1-b.discord.gg",
+  "user": { "id": "7", "username": "owner", "global_name": "Owner" },
+  "users": [{ "id": "8", "username": "friend" }],
+  "relationships": [
+    { "id": "66", "type": 2, "user_id": "66" },
+    { "id": "8", "type": 1, "user_id": "8" }
+  ],
+  "notification_settings": { "flags": 0 },
+  "guilds": [
+    {
+      "id": "555",
+      "joined_at": "2021-05-01T00:00:00.000000+00:00",
+      "properties": { "id": "555", "name": "Elsewhere", "owner_id": "9" },
+      "roles": [{ "id": "555", "name": "@everyone", "permissions": "1024" }],
+      "channels": [{ "id": "5551", "type": 0, "name": "x", "last_message_id": "1300000000000000000" }]
+    },
+    {
+      "id": "1000",
+      "joined_at": "2020-01-01T00:00:00.000000+00:00",
+      "large": false,
+      "member_count": 42,
+      "data_mode": "full",
+      "properties": { "id": "1000", "name": "My Server", "owner_id": "9", "default_message_notifications": 1 },
+      "roles": [
+        { "id": "1000", "name": "@everyone", "permissions": "1024", "position": 0 },
+        { "id": "2000", "name": "mod", "permissions": "0", "position": 1 }
+      ],
+      "channels": [
+        { "id": "3000", "type": 4, "name": "Text", "position": 0, "permission_overwrites": [] },
+        { "id": "3001", "type": 0, "name": "general", "parent_id": "3000", "position": 0,
+          "last_message_id": "1200000000000000001", "permission_overwrites": [] },
+        { "id": "3002", "type": 0, "name": "rules", "parent_id": "3000", "position": 1,
+          "last_message_id": "1200000000000000000" },
+        { "id": "3003", "type": 0, "name": "mods", "parent_id": "3000", "position": 2,
+          "last_message_id": "1200000000000000005",
+          "permission_overwrites": [
+            { "id": "1000", "type": 0, "allow": "0", "deny": "1024" },
+            { "id": "2000", "type": 0, "allow": "1024", "deny": "0" }
+          ] },
+        { "id": "3004", "type": 0, "name": "secret", "parent_id": "3000", "position": 3,
+          "last_message_id": "1200000000000000009",
+          "permission_overwrites": [{ "id": "1000", "type": 0, "allow": "0", "deny": "1024" }] },
+        { "id": "3005", "type": 0, "name": "muted-chan", "parent_id": "3000", "position": 4,
+          "last_message_id": "1200000000000000003" },
+        { "id": "3006", "type": 5, "name": "announcements", "parent_id": "3000", "position": 5,
+          "last_message_id": "1200000000000000004" },
+        { "id": "3010", "type": 4, "name": "Muted category", "position": 1 },
+        { "id": "3011", "type": 0, "name": "in-muted-cat", "parent_id": "3010", "position": 0,
+          "last_message_id": "1200000000000000007" },
+        { "id": "3020", "type": 4, "name": "Expired mute", "position": 2 },
+        { "id": "3021", "type": 0, "name": "expired-mute", "parent_id": "3020", "position": 0,
+          "last_message_id": "1200000000000000008" },
+        { "id": "3030", "type": 2, "name": "Voice", "position": 0, "last_message_id": "1200000000000000010" },
+        { "id": "3040", "type": 0, "name": "old-no-readstate", "position": 1,
+          "last_message_id": "600000000000000000" },
+        { "id": "3041", "type": 0, "name": "new-no-readstate", "position": 0,
+          "last_message_id": "1200000000000000011" }
+      ],
+      "threads": []
+    }
+  ],
+  "merged_members": [
+    [{ "user_id": "7", "roles": [], "joined_at": "2021-05-01T00:00:00.000000+00:00" }],
+    [{ "user_id": "7", "roles": ["2000"], "joined_at": "2020-01-01T00:00:00.000000+00:00" }]
+  ],
+  "read_state": {
+    "version": 1234,
+    "partial": false,
+    "entries": [
+      { "id": "3001", "last_message_id": "1200000000000000000", "mention_count": 0, "flags": 1 },
+      { "id": "3002", "last_message_id": "1200000000000000000", "mention_count": 0 },
+      { "id": "3003", "last_message_id": "1200000000000000000", "mention_count": 2 },
+      { "id": "3004", "last_message_id": "0", "mention_count": 0 },
+      { "id": "3005", "last_message_id": "1200000000000000000", "mention_count": 0 },
+      { "id": "3006", "last_message_id": "1200000000000000000", "mention_count": 1 },
+      { "id": "3011", "last_message_id": "1200000000000000000", "mention_count": 0 },
+      { "id": "3021", "last_message_id": "1200000000000000000", "mention_count": 0 },
+      { "id": "555", "read_state_type": 1, "last_acked_id": "1", "badge_count": 3 }
+    ]
+  },
+  "user_guild_settings": {
+    "version": 99,
+    "partial": false,
+    "entries": [
+      { "guild_id": null, "muted": false, "channel_overrides": [] },
+      {
+        "guild_id": "1000",
+        "muted": false,
+        "mute_config": null,
+        "message_notifications": 1,
+        "suppress_everyone": true,
+        "suppress_roles": false,
+        "flags": 0,
+        "channel_overrides": [
+          { "channel_id": "3005", "muted": true, "mute_config": null, "message_notifications": 3, "collapsed": false },
+          { "channel_id": "3006", "muted": true, "mute_config": null, "message_notifications": 3, "collapsed": false },
+          { "channel_id": "3010", "muted": true, "mute_config": { "end_time": "2999-01-01T00:00:00+00:00", "selected_time_window": -1 },
+            "message_notifications": 3, "collapsed": false },
+          { "channel_id": "3011", "muted": false, "mute_config": null, "message_notifications": 0, "collapsed": false },
+          { "channel_id": "3020", "muted": true, "mute_config": { "end_time": "2020-01-01T00:00:00+00:00", "selected_time_window": 3600 },
+            "message_notifications": 3, "collapsed": false }
+        ]
+      }
+    ]
+  }
+}

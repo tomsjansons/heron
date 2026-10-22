@@ -1,0 +1,105 @@
+{
+  "settings": {
+    "heron_command": {
+      "label": "heron command",
+      "description": "The heron CLI. Use an absolute path (for example ~/.cargo/bin/heron) if the shell's PATH does not include it."
+    },
+    "notify_mail": {
+      "label": "Notify on new mail",
+      "description": "Show a notification with sender and subject when new mail arrives."
+    },
+    "reminder_minutes": {
+      "label": "Event reminder (minutes)",
+      "description": "Notify this many minutes before a calendar event starts. 0 turns reminders off."
+    }
+  },
+  "counts": {
+    "new": "new",
+    "unread": "unread"
+  },
+  "status": {
+    "connecting": "Connecting to herond…",
+    "connected": "Connected to herond",
+    "daemon_down": "herond is not running. Start it (or its systemd unit); retrying automatically.",
+    "error": "{message}",
+    "command_missing": "Cannot run '{command}'. Set the heron command in the plugin settings to an absolute path.",
+    "spawn_failed": "Could not start heron watch"
+  },
+  "kind": {
+    "gmail": "Gmail",
+    "google_calendar": "Google Calendar",
+    "proton_mail": "Proton Mail",
+    "proton_calendar": "Proton Calendar",
+    "discord": "Discord"
+  },
+  "provider": {
+    "gmail": "Gmail",
+    "proton": "Proton Mail"
+  },
+  "source": {
+    "needs_auth": "{kind} ({source}) needs a login: run `{command}`",
+    "error": "{kind} ({source}): {message}",
+    "unknown_error": "failing, retrying"
+  },
+  "time": {
+    "now": "now",
+    "minutes": "{n}m",
+    "hours": "{n}h",
+    "days": "{n}d"
+  },
+  "widget": {
+    "mail": {
+      "account": "{new} new, {unread} unread",
+      "empty": "No mail accounts configured"
+    },
+    "agenda": {
+      "now": "now · {title}",
+      "tomorrow": "tomorrow {time} {title}",
+      "empty": "Nothing in the next 24 hours"
+    },
+    "discord": {
+      "none": "No Discord server configured",
+      "tooltip": "{name}: {channels} unread channels, {mentions} mentions"
+    }
+  },
+  "panel": {
+    "refresh": "Reconnect to herond",
+    "close": "Close",
+    "render_error": "RENDER ERROR"
+  },
+  "inbox": {
+    "title": "Inbox",
+    "mark_read": "Mark read",
+    "mark_unread": "Mark unread",
+    "account_counts": "{new} new · {unread} unread",
+    "account_empty": "No unread mail",
+    "no_accounts": "No mail accounts configured in herond."
+  },
+  "calendar": {
+    "title": "Agenda",
+    "today": "TODAY",
+    "tomorrow": "TOMORROW",
+    "later": "LATER",
+    "all_day": "all day",
+    "nothing_today": "Nothing else today",
+    "summary": {
+      "one": "{count} upcoming event",
+      "other": "{count} upcoming events"
+    }
+  },
+  "channels": {
+    "title": "Discord",
+    "summary": "{channels} unread · {mentions} mentions",
+    "empty": "All caught up",
+    "open_server": "Open server"
+  },
+  "notify": {
+    "action_failed": "heron {action} failed",
+    "new_mail": {
+      "one": "{count} new message",
+      "other": "{count} new messages"
+    },
+    "more": "and {count} more",
+    "event_soon": "{title} in {minutes} min"
+  }
+}
