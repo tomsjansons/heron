@@ -34,7 +34,7 @@ crates/
   heron-google   OAuth CLI login, Gmail IMAP IDLE, Calendar API
   heron-discord  user gateway, read state, permissions, mutes
   herond         one supervised task per source; socket at $XDG_RUNTIME_DIR/heron.sock
-  heron          CLI: status | watch | ack | mark-read | mark-unread | reload | auth | logout
+  heron          CLI: status | watch | message | event | ack | mark-(un)read | mark-(un)seen | trash | reload | auth | logout | init
 plugin/          Noctalia plugin toms/heron (see plugin/README.md)
 contrib/         systemd user unit, example config
 ```

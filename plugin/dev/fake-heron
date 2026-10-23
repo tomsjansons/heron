@@ -99,6 +99,7 @@ def build(state):
     forced_unread = set(state["unread"])
     seen = set(state.get("seen", []))
     unseen = set(state.get("unseen", []))
+    trashed = set(state.get("trashed", []))
     mail = []
     total_new = total_unread = 0
     for account, (provider, label, rows) in accounts.items():
@@ -106,6 +107,8 @@ def build(state):
         messages = []
         for mid, sender, subject, received in rows:
             key = account + "/" + mid
+            if key in trashed:
+                continue
             unread = key not in read or key in forced_unread
             # "new": unread, and arrived after the ack and not marked seen, or
             # pinned by mark-unseen (which outlives an ack until marked seen).
@@ -339,7 +342,7 @@ def main(argv):
         f.write("%s %s\n" % (time.strftime("%H:%M:%S"), " ".join(argv)))
     if not argv:
         print("usage: fake-heron watch|status --json|ack|mark-read|mark-unread|mark-seen|mark-unseen|"
-              "message|event|reload", file=sys.stderr)
+              "trash|message|event|reload", file=sys.stderr)
         return 2
     cmd, args = argv[0], argv[1:]
     if cmd == "watch":
@@ -364,6 +367,8 @@ def main(argv):
             read.discard(key)
             unread.add(key)
         state["read"], state["unread"] = sorted(read), sorted(unread)
+    elif cmd in ("trash", "delete") and len(args) == 2:
+        state["trashed"] = sorted(set(state.get("trashed", [])) | {args[0] + "/" + args[1]})
     elif cmd in ("mark-seen", "mark-unseen") and len(args) == 2:
         key = args[0] + "/" + args[1]
         seen, unseen = set(state.get("seen", [])), set(state.get("unseen", []))

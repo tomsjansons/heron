@@ -37,6 +37,8 @@ local hoveredKey = nil
 -- "account/id" -> true while an action is in flight, so buttons can show it
 -- without waiting for the next snapshot.
 local pending = {}
+-- Messages moved to trash, hidden until the next snapshot drops them.
+local trashed = {}
 local current = heron.read()
 
 -- Preview state. `preview` is nil in the list view.
@@ -94,6 +96,16 @@ end
 
 local function toggleRead(account, message)
   act(message.unread and "mark-read" or "mark-unread", account.id, message.id)
+end
+
+-- Moves a message to the account's trash and hides it right away.
+local function trash(account, message, onOk)
+  act("trash", account.id, message.id, function()
+    trashed[keyOf(account.id, message.id)] = true
+    if onOk then
+      onOk()
+    end
+  end)
 end
 
 -- Strips carriage returns and trailing blanks and collapses runs of blank
@@ -284,6 +296,17 @@ local function messageRow(account, message, now)
         toggleRead(account, message)
       end,
     }),
+    ui.button({
+      key = key .. "-trash",
+      glyph = "trash",
+      glyphSize = 14,
+      variant = "ghost",
+      enabled = not busy,
+      tooltip = noctalia.tr("inbox.trash"),
+      onClick = function()
+        trash(account, message)
+      end,
+    }),
   })
 end
 
@@ -351,7 +374,9 @@ local function listView(snapshot, children)
     end
     local now = heron.now()
     for _, message in ipairs(active.messages) do
-      rows[#rows + 1] = messageRow(active, message, now)
+      if not trashed[keyOf(active.id, message.id)] then
+        rows[#rows + 1] = messageRow(active, message, now)
+      end
     end
   else
     rows[#rows + 1] = ui.label({ key = "no-accounts", text = noctalia.tr("inbox.no_accounts"), fontSize = 12, color = "on_surface/0.6" })
@@ -432,6 +457,18 @@ local function previewButtons()
       end,
     }),
   }
+  buttons[#buttons + 1] = ui.button({
+    key = "pv-trash",
+    text = noctalia.tr("inbox.trash"),
+    glyph = "trash",
+    glyphSize = 14,
+    fontSize = 12,
+    variant = "outline",
+    enabled = not busy,
+    onClick = function()
+      trash(account, message, closePreview)
+    end,
+  })
   if message.url ~= "" then
     buttons[#buttons + 1] = ui.button({
       key = "pv-open",

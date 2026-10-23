@@ -131,6 +131,7 @@ impl Daemon {
                 Request::Ack { account } => self.hub.ack(account.as_deref()),
                 Request::MarkRead { account, id } => self.hub.mark_read(&account, &id).await,
                 Request::MarkUnread { account, id } => self.hub.mark_unread(&account, &id).await,
+                Request::Trash { account, id } => self.hub.trash(&account, &id).await,
                 Request::MarkSeen { account, id } => self.hub.mark_seen(&account, &id),
                 Request::MarkUnseen { account, id } => self.hub.mark_unseen(&account, &id),
                 Request::Message { account, id } => {

@@ -27,6 +27,8 @@ use crate::keys::Keyring;
 
 /// Label id of the inbox.
 const INBOX: &str = "0";
+/// System label for Trash (go-proton-api `TrashLabel`).
+const TRASH: &str = "3";
 /// Largest page the messages route serves (go-proton-api `maxPageSize`).
 const MAX_PAGE: usize = 150;
 const EVENT_POLL: Duration = Duration::from_secs(25);
@@ -267,6 +269,11 @@ async fn apply(api: &Api, command: &MailCommand) -> Result<()> {
     let (route, id) = match command {
         MailCommand::MarkRead { id, .. } => ("/mail/v4/messages/read", id),
         MailCommand::MarkUnread { id, .. } => ("/mail/v4/messages/unread", id),
+        MailCommand::Trash { id, .. } => {
+            // Trashing is labelling with the system Trash label.
+            let body = json!({ "LabelID": TRASH, "IDs": [id] });
+            return api.put::<IgnoredAny>("/mail/v4/messages/label", &body).await.map(drop);
+        }
         MailCommand::Fetch { .. } => anyhow::bail!("fetch is not a flag change"),
     };
     api.put::<IgnoredAny>(route, &json!({ "IDs": [id] })).await.map(drop)
@@ -274,7 +281,7 @@ async fn apply(api: &Api, command: &MailCommand) -> Result<()> {
 
 fn reply(command: MailCommand, result: Result<()>) {
     match (command, result) {
-        (MailCommand::MarkRead { reply, .. } | MailCommand::MarkUnread { reply, .. }, result) => {
+        (MailCommand::MarkRead { reply, .. } | MailCommand::MarkUnread { reply, .. } | MailCommand::Trash { reply, .. }, result) => {
             let _ = reply.send(result);
         }
         (other, result) => other.fail(result.err().unwrap_or_else(|| anyhow::anyhow!("unexpected reply"))),

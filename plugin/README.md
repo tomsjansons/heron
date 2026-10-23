@@ -30,7 +30,7 @@ publishes every snapshot; bar widgets and panels render from it.
   herond is unreachable. Click toggles the `inbox` panel, opened on the widget's
   account tab when it has one.
 - `agenda` - bar widget. The timed event in progress, or the next one within 24
-  hours, as `13:00 - Standup`. All-day events are skipped (the panel shows them).
+  hours, as `13:00 · Standup`. All-day events are skipped (the panel shows them).
   Dims with no text when nothing is coming up. Click toggles the `calendar` panel.
 - `discord` - bar widget. Unread messages and the ones that notify you
   (mentions, reply pings, @everyone, roles) in the configured server: `12 · @3`.
@@ -43,13 +43,14 @@ publishes every snapshot; bar widgets and panels render from it.
   - **List**: one tab per account (label and unread count, a dot while it has
     new mail; the selected tab is remembered), then that account's messages: a
     dot (primary for new), sender, subject and age. The envelope button marks a
-    message read or unread on the server. Accounts that need a login show the
+    message read or unread on the server; the trash button moves it to the
+    account's trash (`heron trash`). Accounts that need a login show the
     exact `heron auth ...` command to run.
   - **Preview**: click a message. Subject, from/to/cc/date, the body as plain
     text (`heron message <account> <id> --json --max-chars 6000`, which never
     marks it read), then its links as clickable rows. Buttons: **Mark read /
     Mark unread** (server), **Mark seen / Mark unseen** (the shell's "new" flag,
-    see below) and **Open in browser**. Opening the preview marks the message
+    see below), **Move to trash** (returns to the list) and **Open in browser**. Opening the preview marks the message
     seen, not read. Shows a loading state, and the error (with Retry) when the
     body cannot be fetched. **Back** returns to the list.
 - `calendar` - panel. Today / Tomorrow / Later groups with time range or "all
@@ -176,7 +177,7 @@ The refresh button in each panel does the same as `reconnect`.
 calendar with an ongoing event, a stand-up with a Google Meet link, tomorrow and
 later events, a Discord server with message previews and mentions (one channel
 capped at `100+`), and sources in `needs_auth` and `error` states. It
-implements `watch`, `status --json`, `ack`, `mark-read`, `mark-unread`,
+implements `watch`, `status --json`, `ack`, `trash`, `mark-read`, `mark-unread`,
 `mark-seen`, `mark-unseen`, `message <account> <id> --json [--max-chars N]` and
 `event <id> --json` (both with a short delay so loading states show;
 `message personal m4` fails like an unsupported provider). A new message

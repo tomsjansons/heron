@@ -225,6 +225,8 @@ pub enum Request {
     MarkSeen { account: String, id: String },
     /// Make one message "new" again, until marked seen.
     MarkUnseen { account: String, id: String },
+    /// Move one message to the account's trash.
+    Trash { account: String, id: String },
     /// Fetch one message's content without marking it read.
     Message { account: String, id: String },
     /// One calendar event with its details.

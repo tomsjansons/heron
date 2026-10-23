@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_imap::extensions::idle::IdleResponse;
 use async_imap::imap_proto::Address;
-use async_imap::types::Fetch;
+use async_imap::types::{Fetch, NameAttribute};
 use futures_util::TryStreamExt as _;
 use heron_core::config::GoogleAccount;
 use heron_core::{Hub, MailCommand, MailUpdate, Message, MessageBody, Provider, SourceKind, SourceState, mailbody};
@@ -134,6 +134,11 @@ impl Ctx<'_> {
                     let (id, seen, reply) = match command {
                         MailCommand::MarkRead { id, reply } => (id, true, reply),
                         MailCommand::MarkUnread { id, reply } => (id, false, reply),
+                        MailCommand::Trash { id, reply } => {
+                            let _ = reply.send(trash(&mut worker, &id).await);
+                            self.publish(&mut worker, cache).await?;
+                            continue;
+                        }
                         MailCommand::Fetch { id, reply } => {
                             // Read state is untouched, so no refresh; a broken
                             // connection shows up in IDLE or the next command.
@@ -232,7 +237,36 @@ fn tls_connector() -> Result<TlsConnector> {
 }
 
 /// Opens an authenticated IMAP session, fetching a fresh access token if needed.
+/// A healthy XOAUTH2 login answers in about two seconds, but async-imap's
+/// AUTHENTICATE now and then stalls waiting for a response that a fresh
+/// connection gets at once. So a stalled login is abandoned quickly and retried.
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(15);
+const LOGIN_ATTEMPTS: u32 = 3;
+
 async fn connect(account: &GoogleAccount, tokens: &Tokens) -> Result<Session> {
+    for attempt in 1..LOGIN_ATTEMPTS {
+        match connect_once(account, tokens).await {
+            Err(err) if err.is::<LoginStalled>() => {
+                debug!("google/{} gmail: IMAP login stalled (attempt {attempt}); reconnecting", account.id);
+            }
+            result => return result,
+        }
+    }
+    connect_once(account, tokens).await
+}
+
+#[derive(Debug)]
+struct LoginStalled;
+
+impl std::fmt::Display for LoginStalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "IMAP login timed out")
+    }
+}
+
+impl std::error::Error for LoginStalled {}
+
+async fn connect_once(account: &GoogleAccount, tokens: &Tokens) -> Result<Session> {
     let token = tokens.access_token().await?;
     let tcp = timeout(CONNECT_TIMEOUT, TcpStream::connect((HOST, PORT))).await
         .context("timed out connecting to imap.gmail.com")?
@@ -248,14 +282,14 @@ async fn connect(account: &GoogleAccount, tokens: &Tokens) -> Result<Session> {
         .context("imap.gmail.com closed the connection")?;
 
     let auth = XOAuth2 { user: account.email.clone(), token, sent: false };
-    match timeout(COMMAND_TIMEOUT, client.authenticate("XOAUTH2", auth)).await {
+    match timeout(LOGIN_TIMEOUT, client.authenticate("XOAUTH2", auth)).await {
         Ok(Ok(session)) => Ok(session),
         Ok(Err((err, _))) => {
             // Most likely an expired or revoked access token; fetch a new one next time.
             tokens.invalidate().await;
             Err(anyhow::anyhow!("Gmail rejected the IMAP login: {err}"))
         }
-        Err(_) => anyhow::bail!("IMAP login timed out"),
+        Err(_) => Err(LoginStalled.into()),
     }
 }
 
@@ -363,6 +397,21 @@ async fn fetch_body(worker: &mut Session, id: &str) -> Result<MessageBody> {
     let mut body = mailbody::from_mime(raw).with_context(|| format!("parsing message {uid}"))?;
     body.id = id.to_owned();
     Ok(body)
+}
+
+/// Moves a message from the INBOX to the mailbox flagged `\Trash`, whose name
+/// depends on the account's language ("[Gmail]/Trash", "[Gmail]/Bin", ...).
+async fn trash(worker: &mut Session, id: &str) -> Result<()> {
+    let uid: u32 = id.parse().with_context(|| format!("not a Gmail message id: {id:?}"))?;
+    let names: Vec<_> = within(async { worker.list(Some(""), Some("*")).await?.try_collect::<Vec<_>>().await }).await
+        .context("listing mailboxes")?;
+    let trash = names.iter()
+        .find(|name| name.attributes().iter().any(|a| matches!(a, NameAttribute::Trash)))
+        .map(|name| name.name().to_owned())
+        .context("this account has no mailbox flagged as Trash")?;
+    within(worker.uid_mv(uid.to_string(), &trash)).await
+        .with_context(|| format!("moving message {uid} to {trash}"))?;
+    Ok(())
 }
 
 async fn set_seen(worker: &mut Session, id: &str, seen: bool) -> Result<()> {

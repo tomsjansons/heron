@@ -58,7 +58,7 @@
       "missing": "No mail account '{account}' in herond"
     },
     "agenda": {
-      "event": "{time} - {title}",
+      "event": "{time} · {title}",
       "empty": "No timed events in the next 24 hours"
     },
     "discord": {
@@ -97,7 +97,8 @@
     "date": "Date",
     "body_failed": "Could not load the message: {message}",
     "no_text": "(no text content)",
-    "links": "LINKS ({count})"
+    "links": "LINKS ({count})",
+    "trash": "Move to trash"
   },
   "calendar": {
     "title": "Agenda",

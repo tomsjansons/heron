@@ -48,6 +48,9 @@ enum Command {
     MarkRead { account: String, id: String },
     /// Mark a message unread on the server.
     MarkUnread { account: String, id: String },
+    /// Move a message to the account's trash.
+    #[command(alias = "delete")]
+    Trash { account: String, id: String },
     /// Clear "new" for one message, leaving it unread.
     MarkSeen { account: String, id: String },
     /// Make one message "new" again until it is marked seen.
@@ -107,6 +110,7 @@ async fn main() -> Result<()> {
         Command::Ack { account } => ok(Request::Ack { account }).await?,
         Command::MarkRead { account, id } => ok(Request::MarkRead { account, id }).await?,
         Command::MarkUnread { account, id } => ok(Request::MarkUnread { account, id }).await?,
+        Command::Trash { account, id } => ok(Request::Trash { account, id }).await?,
         Command::MarkSeen { account, id } => ok(Request::MarkSeen { account, id }).await?,
         Command::MarkUnseen { account, id } => ok(Request::MarkUnseen { account, id }).await?,
         Command::Message { account, id, json, max_chars } => {

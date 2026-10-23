@@ -37,13 +37,15 @@ pub enum MailCommand {
     MarkUnread { id: String, reply: oneshot::Sender<Result<()>> },
     /// Fetch the content without changing the message's read state.
     Fetch { id: String, reply: oneshot::Sender<Result<MessageBody>> },
+    /// Move the message to the account's trash.
+    Trash { id: String, reply: oneshot::Sender<Result<()>> },
 }
 
 impl MailCommand {
     /// Answers with an error, whatever the command.
     pub fn fail(self, err: anyhow::Error) {
         match self {
-            Self::MarkRead { reply, .. } | Self::MarkUnread { reply, .. } => {
+            Self::MarkRead { reply, .. } | Self::MarkUnread { reply, .. } | Self::Trash { reply, .. } => {
                 let _ = reply.send(Err(err));
             }
             Self::Fetch { reply, .. } => {
@@ -189,6 +191,11 @@ impl Hub {
 
     pub async fn mark_unread(&self, account: &str, id: &str) -> Result<()> {
         self.mail_command(account, |reply| MailCommand::MarkUnread { id: id.to_owned(), reply }).await
+    }
+
+    /// Moves one message to the account's trash.
+    pub async fn trash(&self, account: &str, id: &str) -> Result<()> {
+        self.mail_command(account, |reply| MailCommand::Trash { id: id.to_owned(), reply }).await
     }
 
     /// Fetches one message's content from its provider.
