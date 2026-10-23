@@ -33,7 +33,12 @@ enum Command {
         json: bool,
     },
     /// Print the snapshot as JSON, then a new line on every change.
-    Watch,
+    Watch {
+        /// Keep only the newest N messages per account, for consumers with
+        /// tight budgets such as the shell plugin.
+        #[arg(long)]
+        messages: Option<usize>,
+    },
     /// Clear "new" for one account, or every account.
     Ack { account: Option<String> },
     /// Mark a message read on the server.
@@ -74,7 +79,7 @@ async fn main() -> Result<()> {
                 print_status(&snapshot);
             }
         }
-        Command::Watch => watch().await?,
+        Command::Watch { messages } => watch(messages).await?,
         Command::Ack { account } => ok(Request::Ack { account }).await?,
         Command::MarkRead { account, id } => ok(Request::MarkRead { account, id }).await?,
         Command::MarkUnread { account, id } => ok(Request::MarkUnread { account, id }).await?,
@@ -160,10 +165,18 @@ async fn ok(request: Request) -> Result<()> {
     }
 }
 
-async fn watch() -> Result<()> {
+async fn watch(messages: Option<usize>) -> Result<()> {
     let (mut lines, _write) = connect(&Request::Watch).await?;
     while let Some(line) = lines.next_line().await? {
-        println!("{line}");
+        match (messages, serde_json::from_str::<Response>(&line)) {
+            (Some(max), Ok(Response::Snapshot(mut snapshot))) => {
+                for account in &mut snapshot.mail {
+                    account.messages.truncate(max);
+                }
+                println!("{}", serde_json::to_string(&Response::Snapshot(snapshot))?);
+            }
+            _ => println!("{line}"),
+        }
     }
     Ok(())
 }

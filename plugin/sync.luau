@@ -20,6 +20,9 @@ local heron = require("./lib/heron.luau")
 
 local PID_MARK = "__heron_pid__"
 local EXIT_MARK = "__heron_exit__"
+-- Messages per account requested from `heron watch`. Noctalia gives each
+-- callback a small CPU budget; a full snapshot (50 per account) overran it.
+local MAX_MESSAGES = 20
 local BACKOFF_MIN = 2
 local BACKOFF_MAX = 30
 local TICK_IDLE_MS = 15000
@@ -229,8 +232,9 @@ start = function()
     publish()
   end
   local script = string.format(
-    "exec 2>&1; %s watch & echo %s $!; wait $!; echo %s $?",
+    "exec 2>&1; %s watch --messages %d & echo %s $!; wait $!; echo %s $?",
     heron.shellQuote(streamCommand),
+    MAX_MESSAGES,
     PID_MARK,
     EXIT_MARK
   )
