@@ -53,9 +53,8 @@
       "empty": "No mail accounts configured"
     },
     "agenda": {
-      "now": "now · {title}",
-      "tomorrow": "tomorrow {time} {title}",
-      "empty": "Nothing in the next 24 hours"
+      "event": "{time} - {title}",
+      "empty": "No timed events in the next 24 hours"
     },
     "discord": {
       "none": "No Discord server configured",

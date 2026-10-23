@@ -1,13 +1,11 @@
 --!nonstrict
--- Bar widget `agenda`: the ongoing or next calendar event.
+-- Bar widget `agenda`: the timed event in progress or the next one, as
+-- "13:00 - Standup". All-day events are left to the calendar panel.
 --
---   "now · Standup"       a timed event is in progress
---   "14:00 Standup"       the next event within 24 hours
---   "tomorrow 09:00 ..."  the next event is after midnight
---
--- With nothing in the next 24 hours the glyph dims and the text clears. Left
--- click toggles the calendar panel. Re-renders every 30 s so "now" and the day
--- prefix stay current between snapshots.
+-- With nothing in the next 24 hours the glyph dims and the text clears. The
+-- glyph turns primary while the event runs and in the 15 minutes before it.
+-- Left click toggles the calendar panel. Re-renders every 30 s so the shown
+-- event moves on when one ends.
 --
 --   noctalia msg plugin toms/heron:agenda focused probe
 
@@ -45,22 +43,17 @@ local function render()
     return
   end
 
-  local title = ellipsize(event.title, TITLE_MAX)
-  local text
-  if ongoing then
-    text = noctalia.tr("widget.agenda.now", { title = title })
-  elseif heron.dayBucket(event.start, now) == "tomorrow" then
-    text = noctalia.tr("widget.agenda.tomorrow", { time = heron.clock(event.start), title = title })
-  else
-    text = heron.clock(event.start) .. " " .. title
-  end
+  local text = noctalia.tr("widget.agenda.event", {
+    time = heron.clock(event.start),
+    title = ellipsize(event.title, TITLE_MAX),
+  })
   barWidget.setGlyphColor((ongoing or event.start - now <= 15 * 60) and "primary" or "on_surface")
   barWidget.setText(text)
 
-  -- Tooltip: the next few events.
+  -- Tooltip: the next few timed events.
   local rows = {}
   for _, upcoming in ipairs(snapshot.calendar) do
-    if upcoming["end"] > now then
+    if upcoming["end"] > now and not upcoming.all_day then
       local when = heron.timeRange(upcoming)
       if heron.dayBucket(upcoming.start, now) ~= "today" then
         when = noctalia.formatTime("%a", upcoming.start) .. " " .. when

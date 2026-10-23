@@ -379,28 +379,16 @@ function M.timeRange(event)
   return M.clock(event.start) .. " – " .. M.clock(event["end"])
 end
 
--- The ongoing event, else the next one starting within `horizon` seconds.
--- Ongoing all-day events lose to timed ones, which are more useful in a bar.
+-- The timed event in progress, else the next timed event starting within
+-- `horizon` seconds. All-day events are skipped. Returns event, ongoing.
 function M.nextEvent(snapshot, now, horizon)
   if not snapshot then
     return nil, false
   end
-  local allDay = nil
   for _, event in ipairs(snapshot.calendar) do
-    local ongoing = event.start <= now and event["end"] > now
-    if ongoing and not event.all_day then
-      return event, true
-    elseif ongoing and allDay == nil then
-      allDay = event
+    if not event.all_day and event["end"] > now and event.start - now <= horizon then
+      return event, event.start <= now
     end
-  end
-  for _, event in ipairs(snapshot.calendar) do
-    if event.start > now and event.start - now <= horizon and not event.all_day then
-      return event, false
-    end
-  end
-  if allDay then
-    return allDay, true
   end
   return nil, false
 end

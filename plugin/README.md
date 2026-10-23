@@ -25,9 +25,9 @@ publishes every snapshot; bar widgets and panels render from it.
   primary while anything is new and dims while herond is unreachable; the
   tooltip has per-account counts and any account that needs a login. Click
   toggles the `inbox` panel.
-- `agenda` - bar widget. The ongoing event (`now · Standup`) or the next one in
-  the next 24 hours (`14:00 Standup`, `tomorrow 09:00 Planning`). Dims with no
-  text when nothing is coming up. Click toggles the `calendar` panel.
+- `agenda` - bar widget. The timed event in progress, or the next one within 24
+  hours, as `13:00 - Standup`. All-day events are skipped (the panel shows them).
+  Dims with no text when nothing is coming up. Click toggles the `calendar` panel.
 - `discord` - bar widget. Unread channel count in the configured server, with
   `@N` when you have mentions. Click toggles the `channels` panel; right click
   opens the server in the browser.
