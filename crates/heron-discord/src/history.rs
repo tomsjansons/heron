@@ -122,7 +122,7 @@ async fn fetch(client: &reqwest::Client, token: &str, guild_id: u64, channel_id:
 }
 
 /// The rest of the rate-limit bucket's window when it is exhausted.
-fn bucket_wait(headers: &reqwest::header::HeaderMap) -> Duration {
+pub(crate) fn bucket_wait(headers: &reqwest::header::HeaderMap) -> Duration {
     let remaining = headers.get("x-ratelimit-remaining").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
     match remaining {
         Some(0) => header_seconds(headers, "x-ratelimit-reset-after").unwrap_or(DELAY).min(MAX_RETRY_AFTER),
@@ -130,14 +130,14 @@ fn bucket_wait(headers: &reqwest::header::HeaderMap) -> Duration {
     }
 }
 
-fn header_seconds(headers: &reqwest::header::HeaderMap, name: &str) -> Option<Duration> {
+pub(crate) fn header_seconds(headers: &reqwest::header::HeaderMap, name: &str) -> Option<Duration> {
     let seconds = headers.get(name)?.to_str().ok()?.parse::<f64>().ok()?;
     Duration::try_from_secs_f64(seconds).ok()
 }
 
 /// A 429's `retry_after` (seconds, fractional) from the body, else the
 /// header, else five seconds.
-fn retry_after(body: Option<&Value>, header: Option<Duration>) -> Duration {
+pub(crate) fn retry_after(body: Option<&Value>, header: Option<Duration>) -> Duration {
     body.and_then(|b| b.get("retry_after")).and_then(Value::as_f64)
         .and_then(|s| Duration::try_from_secs_f64(s).ok())
         .or(header)

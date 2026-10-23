@@ -160,7 +160,7 @@ def build(state):
     tick = (now - state["started"]) // ARRIVAL_SECONDS
     if os.path.exists(QUIET):
         tick = 1  # keep #announcements visible
-    discord = build_discord(now, tick, state["started"])
+    discord = build_discord(now, tick, state["started"], state.get("discord_read") or [])
 
     sources = [
         {"id": "personal", "kind": "gmail", "state": "ok", "message": None},
@@ -179,7 +179,7 @@ def dmsg(mid, author, content, ago, mentions_me=False):
     return {"id": mid, "author": author, "content": content, "timestamp": ago, "mentions_me": mentions_me}
 
 
-def build_discord(now, tick, started):
+def build_discord(now, tick, started, read=()):
     t = started
     channels = [
         {"id": "c1", "name": "general", "unread": 14, "more": False, "mentions": 2,
@@ -216,6 +216,7 @@ def build_discord(now, tick, started):
                              "mentions": n % 3, "url": "https://discord.com/channels/1/b%d" % n,
                              "messages": [dmsg("b%d-%d" % (n, k), "Someone %d" % k, ("lorem ipsum dolor sit amet " * 8)[:200],
                                                t - k * 60, k == 0) for k in range(3)]})
+    channels = [] if read == "all" else [c for c in channels if c["id"] not in read]
     channels.sort(key=lambda c: -c["mentions"])
     return {"id": "1", "name": "Rustaceans", "unread_channels": len(channels),
             "unread_messages": sum(c["unread"] for c in channels),
@@ -342,7 +343,7 @@ def main(argv):
         f.write("%s %s\n" % (time.strftime("%H:%M:%S"), " ".join(argv)))
     if not argv:
         print("usage: fake-heron watch|status --json|ack|mark-read|mark-unread|mark-seen|mark-unseen|"
-              "trash|message|event|reload", file=sys.stderr)
+              "trash|message|event|discord-read|reload", file=sys.stderr)
         return 2
     cmd, args = argv[0], argv[1:]
     if cmd == "watch":
@@ -401,6 +402,9 @@ def main(argv):
             return 1
         print(json.dumps(reply))
         return 0
+    elif cmd == "discord-read" and args:
+        time.sleep(0.3)
+        state["discord_read"] = "all" if args[0] == "--all" else sorted(set(state.get("discord_read") or []) | {args[0]})
     elif cmd == "reload":
         pass
     else:

@@ -145,6 +145,7 @@ impl Daemon {
                     send(&mut write, &response).await?;
                     continue;
                 }
+                Request::DiscordMarkRead { channel } => self.hub.discord_mark_read(channel.as_deref()).await,
                 Request::Event { id } => {
                     let response = match self.hub.event(&id) {
                         Some(event) => Response::Event(event),

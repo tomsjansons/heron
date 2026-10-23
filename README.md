@@ -15,7 +15,7 @@ been exercised against a live account yet.
 | Proton Calendar | Native Proton API, read-only. Key chain: user key → address key → calendar passphrase → calendar key → event session key. Crypto from [`proton-crypto-rs`](https://github.com/ProtonMail/proton-crypto-rs). |
 | Gmail | IMAP + IDLE with XOAUTH2. |
 | Google Calendar | Calendar API v3 with incremental sync tokens, several accounts. |
-| Discord | One server's unread channels and mentions over the gateway. |
+| Discord | One server's unread channels and mentions over the gateway. Channels can be marked read (`heron discord-read`). |
 
 ## New vs unread
 
@@ -79,8 +79,9 @@ PATH usually lacks `~/.cargo/bin`) and add the `toms/heron:mail`,
 - **Proton**: the API is undocumented. heron identifies itself honestly
   (`x-pm-appversion: Other`), which may make human verification more likely
   at login. Calendar signatures are not verified.
-- **Discord**: uses your user token, read-only. That is against Discord's
-  terms; you accept the risk. heron never sends messages, acks or presence.
+- **Discord**: uses your user token. That is against Discord's terms; you
+  accept the risk. heron never sends messages or presence; the only write is
+  marking channels read, and only when you ask (`heron discord-read`).
 - **Google**: an OAuth app left in "Testing" gets refresh tokens that expire
   after 7 days; publish it ("In production") for your own use.
 

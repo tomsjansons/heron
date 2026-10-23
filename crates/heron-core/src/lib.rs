@@ -12,7 +12,7 @@ pub mod secrets;
 use serde::{Deserialize, Serialize};
 
 pub use config::Config;
-pub use hub::{Hub, MailCommand, MailUpdate};
+pub use hub::{DiscordCommand, Hub, MailCommand, MailUpdate};
 pub use paths::socket_path;
 
 /// Everything the shell needs to render, published as one value.
@@ -231,6 +231,9 @@ pub enum Request {
     Message { account: String, id: String },
     /// One calendar event with its details.
     Event { id: String },
+    /// Mark one Discord channel read up to its newest message, or every
+    /// listed channel when `channel` is `None`.
+    DiscordMarkRead { channel: Option<String> },
     /// Re-read the config and restart every provider.
     Reload,
 }

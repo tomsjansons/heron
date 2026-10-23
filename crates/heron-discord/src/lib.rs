@@ -1,11 +1,13 @@
-//! Unread state of one Discord server, read-only, over the user gateway.
+//! Unread state of one Discord server over the user gateway.
 //!
-//! Uses the owner's own user token. Nothing is ever sent that changes state
-//! on Discord: no messages, no acks, no presence changes. One gateway
+//! Uses the owner's own user token. The only change ever sent to Discord is
+//! marking channels read, and only when the user asks (see [`ack`]): no
+//! messages, no automatic acks, no presence changes. One gateway
 //! connection per daemon run, no REST polling: message history is fetched
 //! once per unread channel (as opening it in the client would) and then kept
 //! current from gateway events.
 
+mod ack;
 mod client;
 mod gateway;
 mod history;
@@ -18,9 +20,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use heron_core::config::DiscordConfig;
-use heron_core::{Hub, SourceKind, SourceState, secrets};
+use heron_core::{DiscordCommand, Hub, SourceKind, SourceState, secrets};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
 use tracing::{info, warn};
@@ -75,6 +77,10 @@ pub async fn run(config: DiscordConfig, hub: Hub) -> Result<()> {
     let (fetch_tx, fetch_rx) = mpsc::unbounded_channel();
     let (history_tx, mut history_rx) = mpsc::channel(64);
     let _history = AbortOnDrop(tokio::spawn(history::run(credentials.token.clone(), guild_id, fetch_rx, history_tx)));
+    let mut commands = hub.register_discord();
+    let (acked_tx, mut acked_rx) = mpsc::channel::<Acked>(16);
+    let http = client::http()?;
+    let token = credentials.token.clone();
     let mut gateway = AbortOnDrop(tokio::spawn(gateway::run(credentials.token, guild_id, tx)));
     let mut guild = GuildState::new(guild_id);
     let mut publish_at: Option<Instant> = None;
@@ -100,6 +106,32 @@ pub async fn run(config: DiscordConfig, hub: Hub) -> Result<()> {
                 Some(Event::Disconnected(reason)) => status(SourceState::Error, Some(reason)),
                 None => break,
             },
+            Some(DiscordCommand::MarkRead { channel, reply }) = commands.recv() => {
+                let channel = match channel.as_deref().map(str::parse::<u64>) {
+                    None => None,
+                    Some(Ok(id)) => Some(id),
+                    Some(Err(_)) => {
+                        let _ = reply.send(Err(anyhow::anyhow!("{:?} is not a Discord channel id", channel.unwrap_or_default())));
+                        continue;
+                    }
+                };
+                let Some(targets) = guild.ack_targets(channel, jiff::Timestamp::now()) else {
+                    let _ = reply.send(Err(anyhow::anyhow!("no channel {} in this server", channel.unwrap_or_default())));
+                    continue;
+                };
+                // Off the loop, so gateway events keep flowing meanwhile.
+                let (http, token, acked_tx) = (http.clone(), token.clone(), acked_tx.clone());
+                tokio::spawn(async move {
+                    let result = ack::ack(&http, &token, guild_id, &targets).await;
+                    let _ = acked_tx.send(Acked { targets, result, reply }).await;
+                });
+            }
+            Some(Acked { targets, result, reply }) = acked_rx.recv() => {
+                if result.is_ok() && guild.mark_read(&targets) {
+                    hub.set_discord(guild.snapshot(jiff::Timestamp::now()));
+                }
+                let _ = reply.send(result);
+            }
             Some(history::History { channel_id, result }) = history_rx.recv() => {
                 if guild.load_history(channel_id, result, jiff::Timestamp::now()) {
                     publish_at.get_or_insert_with(|| Instant::now() + DEBOUNCE);
@@ -132,6 +164,13 @@ pub async fn run(config: DiscordConfig, hub: Hub) -> Result<()> {
     }
 }
 
+/// An acknowledgement request that finished.
+struct Acked {
+    targets: Vec<(u64, u64)>,
+    result: Result<()>,
+    reply: oneshot::Sender<Result<()>>,
+}
+
 /// Queues history fetches for unread channels whose messages are unknown.
 fn request_history(guild: &mut GuildState, fetch_tx: &mpsc::UnboundedSender<u64>, now: jiff::Timestamp) {
     for channel in guild.take_fetches(now) {
@@ -143,8 +182,9 @@ fn request_history(guild: &mut GuildState, fetch_tx: &mpsc::UnboundedSender<u64>
 /// Prompts for a user token on the terminal, checks it, and stores it.
 pub async fn login() -> Result<()> {
     println!("heron reads unread counts for one Discord server with your own user token.");
-    println!("It never sends messages or marks anything read. Using a user token outside the");
-    println!("official clients is against Discord's terms; you accept that risk.");
+    println!("It never sends messages; it marks channels read only when you ask it to.");
+    println!("Using a user token outside the official clients is against Discord's terms;");
+    println!("you accept that risk.");
     println!();
     println!("To find the token: open https://discord.com/app in a browser and sign in,");
     println!("open the developer tools (F12) > Network, filter for \"api\", click any request");

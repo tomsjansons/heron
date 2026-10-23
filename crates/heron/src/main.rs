@@ -55,6 +55,15 @@ enum Command {
     MarkSeen { account: String, id: String },
     /// Make one message "new" again until it is marked seen.
     MarkUnseen { account: String, id: String },
+    /// Mark a Discord channel read on Discord, or every unread channel.
+    DiscordRead {
+        /// Channel id, as in `heron status --json`.
+        #[arg(required_unless_present = "all")]
+        channel: Option<String>,
+        /// Mark every listed channel read.
+        #[arg(long, conflicts_with = "channel")]
+        all: bool,
+    },
     /// Show a message's content without marking it read.
     Message {
         account: String,
@@ -113,6 +122,7 @@ async fn main() -> Result<()> {
         Command::Trash { account, id } => ok(Request::Trash { account, id }).await?,
         Command::MarkSeen { account, id } => ok(Request::MarkSeen { account, id }).await?,
         Command::MarkUnseen { account, id } => ok(Request::MarkUnseen { account, id }).await?,
+        Command::DiscordRead { channel, .. } => ok(Request::DiscordMarkRead { channel }).await?,
         Command::Message { account, id, json, max_chars } => {
             match parse(&request_one(&Request::Message { account, id }).await?)? {
                 Response::Message(mut body) => {

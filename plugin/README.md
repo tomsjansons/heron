@@ -65,8 +65,9 @@ publishes every snapshot; bar widgets and panels render from it.
 - `channels` - panel. Unread channels, most mentions first. Each channel header
   shows its unread count and @mentions; under it, previews of its newest unread
   messages (at most three: author, text, age), with messages that notify you
-  highlighted. Click a channel or a preview to open the channel; "Open server"
-  opens the whole server.
+  highlighted. Click a channel or a preview to open the channel; its check
+  button marks it read on Discord. "Mark all read" marks every listed channel
+  read; "Open server" opens the whole server.
 
 Open the panels without a widget:
 
@@ -178,7 +179,7 @@ calendar with an ongoing event, a stand-up with a Google Meet link, tomorrow and
 later events, a Discord server with message previews and mentions (one channel
 capped at `100+`), and sources in `needs_auth` and `error` states. It
 implements `watch`, `status --json`, `ack`, `trash`, `mark-read`, `mark-unread`,
-`mark-seen`, `mark-unseen`, `message <account> <id> --json [--max-chars N]` and
+`mark-seen`, `mark-unseen`, `discord-read`, `message <account> <id> --json [--max-chars N]` and
 `event <id> --json` (both with a short delay so loading states show;
 `message personal m4` fails like an unsupported provider). A new message
 arrives every 20 seconds (five in total). Actions persist to
@@ -212,8 +213,8 @@ noctalia plugins lint .
   & ...; wait"` for as long as the plugin is enabled. The wrapper reports the
   watch pid (so a reconnect can `kill` it) and its exit code, because
   `runStream` does not report a child exiting. Panels run `heron ack`,
-  `mark-read`, `mark-unread`, `mark-seen`, `mark-unseen`, `message` and `event`
-  with argv (no shell), and `xdg-open <url>` for http(s) and mailto links only.
+  `mark-read`, `mark-unread`, `mark-seen`, `mark-unseen`, `discord-read`,
+  `message` and `event` with argv (no shell), and `xdg-open <url>` for http(s) and mailto links only.
   The calendar panel writes meeting links to the clipboard
   (`noctalia.copyToClipboard`).
 - CPU budget: Noctalia gives each script callback a small CPU budget, and a

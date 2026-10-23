@@ -55,6 +55,14 @@ impl MailCommand {
     }
 }
 
+/// Sent to the Discord provider. Reply once Discord has accepted the change
+/// and the published snapshot reflects it.
+#[derive(Debug)]
+pub enum DiscordCommand {
+    /// One channel by id, or every listed channel.
+    MarkRead { channel: Option<String>, reply: oneshot::Sender<Result<()>> },
+}
+
 /// What the shell has seen, persisted in `seen.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 struct Seen {
@@ -98,6 +106,7 @@ struct Inner {
     seen: Seen,
     labels: BTreeMap<String, String>,
     mail_commands: HashMap<String, mpsc::Sender<MailCommand>>,
+    discord_commands: Option<mpsc::Sender<DiscordCommand>>,
     /// Fetched message content by (account, id), for listed messages only.
     bodies: HashMap<(String, String), MessageBody>,
 }
@@ -113,6 +122,7 @@ impl Hub {
             seen: load_seen(),
             labels: BTreeMap::new(),
             mail_commands: HashMap::new(),
+            discord_commands: None,
             bodies: HashMap::new(),
         };
         let (tx, _) = watch::channel(Snapshot::default());
@@ -132,6 +142,7 @@ impl Hub {
         inner.discord = None;
         inner.status.clear();
         inner.mail_commands.clear();
+        inner.discord_commands = None;
         inner.bodies.clear();
         self.publish(&inner);
     }
@@ -196,6 +207,24 @@ impl Hub {
         let (tx, rx) = mpsc::channel(16);
         self.lock().mail_commands.insert(account.to_owned(), tx);
         rx
+    }
+
+    /// Called by the Discord provider; commands arrive on the receiver.
+    pub fn register_discord(&self) -> mpsc::Receiver<DiscordCommand> {
+        let (tx, rx) = mpsc::channel(16);
+        self.lock().discord_commands = Some(tx);
+        rx
+    }
+
+    /// Marks one Discord channel read, or every listed channel.
+    pub async fn discord_mark_read(&self, channel: Option<&str>) -> Result<()> {
+        let sender = self.lock().discord_commands.clone().context("discord is not running")?;
+        let (reply, response) = oneshot::channel();
+        let command = DiscordCommand::MarkRead { channel: channel.map(str::to_owned), reply };
+        sender.send(command).await.context("discord provider stopped")?;
+        tokio::time::timeout(Duration::from_secs(60), response).await
+            .context("discord provider did not answer in 60s")?
+            .context("discord provider dropped the request")?
     }
 
     pub async fn mark_read(&self, account: &str, id: &str) -> Result<()> {
@@ -430,6 +459,7 @@ mod tests {
             seen: Seen { acks: BTreeMap::from([("p".to_owned(), 100)]), ..Seen::default() },
             labels: BTreeMap::new(),
             mail_commands: HashMap::new(),
+            discord_commands: None,
             bodies: HashMap::new(),
         };
         let update = MailUpdate {
@@ -487,6 +517,7 @@ mod tests {
             seen: Seen::default(),
             labels: BTreeMap::new(),
             mail_commands: HashMap::new(),
+            discord_commands: None,
             bodies: HashMap::new(),
         };
         let ids: Vec<String> = inner.snapshot(1_000).calendar.into_iter().map(|e| e.id).collect();

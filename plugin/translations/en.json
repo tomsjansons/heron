@@ -124,6 +124,8 @@
     "summary": "{messages} unread in {channels} channels · @{mentions}",
     "empty": "All caught up",
     "open_server": "Open server",
+    "mark_read": "Mark channel read",
+    "mark_all_read": "Mark all read",
     "unread": "{count}",
     "no_text": "(no text)"
   },

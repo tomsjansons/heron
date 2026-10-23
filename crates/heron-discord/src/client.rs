@@ -71,6 +71,19 @@ pub fn get(client: &reqwest::Client, token: &str, url: &str, referer: &str) -> r
         .header("X-Super-Properties", super_properties())
 }
 
+/// A POST with the same headers as [`get`] and a JSON body.
+pub fn post(client: &reqwest::Client, token: &str, url: &str, referer: &str, body: &Value) -> reqwest::RequestBuilder {
+    client.post(url)
+        .header("Authorization", token)
+        .header("Accept", "*/*")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .header("Referer", referer)
+        .header("Origin", ORIGIN)
+        .header("X-Discord-Locale", LOCALE)
+        .header("X-Super-Properties", super_properties())
+        .json(body)
+}
+
 /// `GET /users/@me`; `Ok(None)` when Discord rejects the token.
 pub async fn current_user(token: &str) -> Result<Option<User>> {
     let response = get(&http()?, token, &format!("{API}/users/@me"), &format!("{ORIGIN}/channels/@me"))

@@ -7,14 +7,17 @@
 -- unread count ("100+" when capped) and @mentions; under it, previews of its
 -- newest unread messages (at most 3: author, text, age), with messages that
 -- notify you highlighted. Clicking a channel or a preview opens the channel in
--- the browser (or the Discord app, if it handles discord.com links); the button
--- at the bottom opens the whole server.
+-- the browser (or the Discord app, if it handles discord.com links). The check
+-- button on a channel marks it read on Discord; the buttons at the bottom mark
+-- every listed channel read and open the whole server.
 
 local heron = require("./lib/heron.luau")
 
 local isOpen = false
 local hoveredKey = nil
 local current = heron.read()
+-- Channel ids (or "all") with a mark-read request in flight.
+local pending = {}
 
 local render -- forward declaration
 
@@ -29,6 +32,22 @@ local function hoverFill(props, key)
     props.fill = "surface_variant/0.5"
   end
   return props
+end
+
+-- Marks one channel read on Discord, or every listed channel when channelId is
+-- nil. herond publishes the new snapshot before answering, so the channel drops
+-- out of the list by the time this finishes.
+local function markRead(channelId)
+  local key = channelId or "all"
+  if pending[key] then
+    return
+  end
+  pending[key] = true
+  heron.run(channelId and { "discord-read", channelId } or { "discord-read", "--all" }, function()
+    pending[key] = nil
+    render()
+  end)
+  render()
 end
 
 local function channelRow(channel)
@@ -67,6 +86,17 @@ local function channelRow(channel)
   if channel.mentions > 0 then
     children[#children + 1] = badge("@" .. channel.mentions, "primary", "on_primary")
   end
+  children[#children + 1] = ui.button({
+    key = key .. "-read",
+    glyph = "checks",
+    glyphSize = 14,
+    variant = "ghost",
+    enabled = not pending[channel.id] and not pending.all,
+    tooltip = noctalia.tr("channels.mark_read"),
+    onClick = function()
+      markRead(channel.id)
+    end,
+  })
   children[#children + 1] = ui.glyph({ name = "external-link", size = 12, color = "on_surface/0.4" })
   return ui.row(props, children)
 end
@@ -169,15 +199,33 @@ local function build()
   children[#children + 1] = ui.scroll({ flexGrow = 1, gap = 0 }, rows)
 
   if guild and guild.id ~= "" then
-    children[#children + 1] = ui.button({
+    local buttons = {}
+    if #guild.channels > 0 then
+      buttons[#buttons + 1] = ui.button({
+        key = "mark-all-read",
+        text = noctalia.tr("channels.mark_all_read"),
+        glyph = "checks",
+        glyphSize = 14,
+        variant = "ghost",
+        flexGrow = 1,
+        enabled = not pending.all,
+        onClick = function()
+          markRead(nil)
+        end,
+      })
+    end
+    buttons[#buttons + 1] = ui.button({
+      key = "open-server",
       text = noctalia.tr("channels.open_server"),
       glyph = "external-link",
       glyphSize = 14,
       variant = "ghost",
+      flexGrow = 1,
       onClick = function()
         heron.openUrl("https://discord.com/channels/" .. guild.id)
       end,
     })
+    children[#children + 1] = ui.row({ gap = 8 }, buttons)
   end
   return ui.column({ flexGrow = 1, gap = 10 }, children)
 end

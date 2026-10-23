@@ -651,6 +651,32 @@ impl GuildState {
         true
     }
 
+    /// What to acknowledge to mark `channel` read (or every listed channel):
+    /// `(channel, newest message)` for each one that is unread or has
+    /// mentions. `None` when the channel is unknown.
+    pub fn ack_targets(&self, channel: Option<u64>, now: Timestamp) -> Option<Vec<(u64, u64)>> {
+        let pending = |c: &Channel| {
+            let mentions = self.read_states.get(&c.id).map_or(0, |s| s.mentions);
+            let latest = c.last_message_id?;
+            (Some(latest) > self.acked(c.id) || mentions > 0).then_some((c.id, latest))
+        };
+        match channel {
+            Some(id) => Some(pending(self.channels.get(&id)?).into_iter().collect()),
+            None => Some(self.listed(now).iter().filter_map(|l| pending(l.channel)).collect()),
+        }
+    }
+
+    /// Applies acknowledgements Discord accepted, without waiting for the
+    /// gateway to echo them.
+    pub fn mark_read(&mut self, targets: &[(u64, u64)]) -> bool {
+        let mut changed = false;
+        for (channel, message) in targets {
+            let ack = serde_json::json!({"channel_id": channel.to_string(), "message_id": message.to_string(), "mention_count": 0});
+            changed |= self.message_ack(&ack);
+        }
+        changed
+    }
+
     /// Guild, channel or parent category muted, honouring mute end times.
     fn muted(&self, channel: &Channel, now: Timestamp) -> bool {
         self.settings.mute.active(now)
@@ -968,6 +994,21 @@ mod tests {
         let partial = json!({"channel_id": "3001", "message_id": R.to_string(), "mention_count": 0});
         state.apply("MESSAGE_ACK", &partial);
         assert!(names(&state).contains(&("general".into(), 0)));
+    }
+
+    #[test]
+    fn mark_read_targets_and_applies() {
+        let mut state = ready();
+        let now = now();
+        let all = state.ack_targets(None, now).unwrap();
+        assert!(!all.is_empty());
+        assert!(state.ack_targets(Some(999_999), now).is_none());
+        let (channel, _) = all[0];
+        assert_eq!(state.ack_targets(Some(channel), now).unwrap(), vec![all[0]]);
+        assert!(state.mark_read(&all));
+        assert_eq!(state.ack_targets(None, now).unwrap(), vec![]);
+        assert_eq!(state.snapshot(now).unwrap().unread_channels, 0);
+        assert_eq!(state.ack_targets(Some(channel), now).unwrap(), vec![]);
     }
 
     #[test]
