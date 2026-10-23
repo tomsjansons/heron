@@ -506,6 +506,9 @@ impl GuildState {
                 name: channel.name.clone(),
                 mentions,
                 url: format!("https://discord.com/channels/{}/{}", self.guild_id, channel.id),
+                unread: 0,
+                more: false,
+                messages: Vec::new(),
             }));
         }
         listed.sort_by_key(|(key, _)| *key);
@@ -515,6 +518,7 @@ impl GuildState {
             id: self.guild_id.to_string(),
             name: self.name.clone(),
             unread_channels: channels.len() as u32,
+            unread_messages: 0,
             mentions: channels.iter().map(|c| c.mentions).fold(0, u32::saturating_add),
             channels,
         })

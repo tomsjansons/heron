@@ -45,6 +45,27 @@ enum Command {
     MarkRead { account: String, id: String },
     /// Mark a message unread on the server.
     MarkUnread { account: String, id: String },
+    /// Clear "new" for one message, leaving it unread.
+    MarkSeen { account: String, id: String },
+    /// Make one message "new" again until it is marked seen.
+    MarkUnseen { account: String, id: String },
+    /// Show a message's content without marking it read.
+    Message {
+        account: String,
+        id: String,
+        /// Print the message as one JSON line.
+        #[arg(long)]
+        json: bool,
+        /// Cut the text after this many characters (0: no limit).
+        #[arg(long, default_value_t = 0)]
+        max_chars: usize,
+    },
+    /// Show one upcoming calendar event with its details.
+    Event {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Re-read the config and restart every source.
     Reload,
     /// Log in to a source and store its credentials.
@@ -83,6 +104,33 @@ async fn main() -> Result<()> {
         Command::Ack { account } => ok(Request::Ack { account }).await?,
         Command::MarkRead { account, id } => ok(Request::MarkRead { account, id }).await?,
         Command::MarkUnread { account, id } => ok(Request::MarkUnread { account, id }).await?,
+        Command::MarkSeen { account, id } => ok(Request::MarkSeen { account, id }).await?,
+        Command::MarkUnseen { account, id } => ok(Request::MarkUnseen { account, id }).await?,
+        Command::Message { account, id, json, max_chars } => {
+            match parse(&request_one(&Request::Message { account, id }).await?)? {
+                Response::Message(mut body) => {
+                    if max_chars > 0 && body.text.chars().count() > max_chars {
+                        body.text = truncate(&body.text, max_chars);
+                    }
+                    if json {
+                        println!("{}", serde_json::to_string(&Response::Message(body))?);
+                    } else {
+                        print_message(&body);
+                    }
+                }
+                other => anyhow::bail!("unexpected response: {other:?}"),
+            }
+        }
+        Command::Event { id, json } => match parse(&request_one(&Request::Event { id }).await?)? {
+            Response::Event(event) => {
+                if json {
+                    println!("{}", serde_json::to_string(&Response::Event(event))?);
+                } else {
+                    print_event(&event);
+                }
+            }
+            other => anyhow::bail!("unexpected response: {other:?}"),
+        },
         Command::Reload => ok(Request::Reload).await?,
         Command::Auth { provider, account } => {
             auth(provider, account.as_deref(), false).await?;
@@ -156,12 +204,64 @@ async fn request_one(request: &Request) -> Result<String> {
     lines.next_line().await?.context("herond closed the connection")
 }
 
+/// Parses a response line, turning an error response into an error.
+fn parse(line: &str) -> Result<Response> {
+    match serde_json::from_str(line)? {
+        Response::Error { message } => anyhow::bail!(message),
+        response => Ok(response),
+    }
+}
+
 /// Sends a request that answers `ok` or an error.
 async fn ok(request: Request) -> Result<()> {
-    match serde_json::from_str(&request_one(&request).await?)? {
+    match parse(&request_one(&request).await?)? {
         Response::Ok => Ok(()),
-        Response::Error { message } => anyhow::bail!(message),
-        Response::Snapshot(_) => anyhow::bail!("unexpected snapshot"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+}
+
+fn print_message(body: &heron_core::MessageBody) {
+    let style = Style::new();
+    println!("{}", style.bold(&body.subject));
+    println!("{} {}", style.dim("From:"), body.from);
+    if !body.to.is_empty() {
+        println!("{} {}", style.dim("To:  "), body.to.join(", "));
+    }
+    if !body.cc.is_empty() {
+        println!("{} {}", style.dim("Cc:  "), body.cc.join(", "));
+    }
+    println!("{} {}\n", style.dim("Date:"), when(body.date, false).trim_end());
+    println!("{}", body.text.trim_end());
+    if !body.links.is_empty() {
+        println!("\n{}", style.bold("Links"));
+        for (n, link) in body.links.iter().enumerate() {
+            let label = if link.text == link.url { String::new() } else { format!("{}  ", truncate(&link.text, 40)) };
+            println!("  [{}] {label}{}", n + 1, style.accent(&link.url));
+        }
+    }
+}
+
+fn print_event(event: &heron_core::CalendarEvent) {
+    let style = Style::new();
+    println!("{}", style.bold(&event.title));
+    println!("{} {}  {}", when(event.start, event.all_day), style.dim("→"), until(event.end, event.all_day).trim_end());
+    println!("{} {}", style.dim("Calendar:"), event.calendar);
+    if let Some(location) = &event.location {
+        println!("{} {location}", style.dim("Where:   "));
+    }
+    if let Some(url) = &event.meeting_url {
+        println!("{} {}", style.dim("Join:    "), style.accent(url));
+    }
+    if let Some(details) = &event.details {
+        if let Some(organizer) = &details.organizer {
+            println!("{} {organizer}", style.dim("Organizer:"));
+        }
+        if !details.attendees.is_empty() {
+            println!("{} {}", style.dim("Guests:  "), details.attendees.join(", "));
+        }
+        if let Some(description) = &details.description {
+            println!("\n{}", description.trim_end());
+        }
     }
 }
 

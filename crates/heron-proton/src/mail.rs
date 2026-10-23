@@ -162,13 +162,18 @@ async fn apply(api: &Api, command: &MailCommand) -> Result<()> {
     let (route, id) = match command {
         MailCommand::MarkRead { id, .. } => ("/mail/v4/messages/read", id),
         MailCommand::MarkUnread { id, .. } => ("/mail/v4/messages/unread", id),
+        MailCommand::Fetch { .. } => anyhow::bail!("not supported yet"),
     };
     api.put::<IgnoredAny>(route, &json!({ "IDs": [id] })).await.map(drop)
 }
 
 fn reply(command: MailCommand, result: Result<()>) {
-    let (MailCommand::MarkRead { reply, .. } | MailCommand::MarkUnread { reply, .. }) = command;
-    let _ = reply.send(result);
+    match (command, result) {
+        (MailCommand::MarkRead { reply, .. } | MailCommand::MarkUnread { reply, .. }, result) => {
+            let _ = reply.send(result);
+        }
+        (other, result) => other.fail(result.err().unwrap_or_else(|| anyhow::anyhow!("unexpected reply"))),
+    }
 }
 
 /// Runs until the session needs a new login, which is returned as the error.

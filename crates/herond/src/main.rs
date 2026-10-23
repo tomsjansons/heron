@@ -85,6 +85,7 @@ impl Daemon {
         providers.abort_all();
         while providers.join_next().await.is_some() {}
         self.hub.reset(&config.calendar);
+        self.hub.set_labels(config.labels());
 
         for account in &config.proton {
             let (account, config, hub) = (account.clone(), config.clone(), self.hub.clone());
@@ -130,6 +131,24 @@ impl Daemon {
                 Request::Ack { account } => self.hub.ack(account.as_deref()),
                 Request::MarkRead { account, id } => self.hub.mark_read(&account, &id).await,
                 Request::MarkUnread { account, id } => self.hub.mark_unread(&account, &id).await,
+                Request::MarkSeen { account, id } => self.hub.mark_seen(&account, &id),
+                Request::MarkUnseen { account, id } => self.hub.mark_unseen(&account, &id),
+                Request::Message { account, id } => {
+                    let response = match self.hub.fetch_message(&account, &id).await {
+                        Ok(body) => Response::Message(body),
+                        Err(err) => Response::Error { message: format!("{err:#}") },
+                    };
+                    send(&mut write, &response).await?;
+                    continue;
+                }
+                Request::Event { id } => {
+                    let response = match self.hub.event(&id) {
+                        Some(event) => Response::Event(event),
+                        None => Response::Error { message: format!("no upcoming event {id:?}") },
+                    };
+                    send(&mut write, &response).await?;
+                    continue;
+                }
                 Request::Reload => match Config::load() {
                     Ok(config) => {
                         self.start(Arc::new(config)).await;

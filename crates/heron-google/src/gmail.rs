@@ -134,6 +134,10 @@ impl Ctx<'_> {
                     let (id, seen, reply) = match command {
                         MailCommand::MarkRead { id, reply } => (id, true, reply),
                         MailCommand::MarkUnread { id, reply } => (id, false, reply),
+                        other => {
+                            other.fail(anyhow::anyhow!("not supported yet"));
+                            continue;
+                        }
                     };
                     // A refused change leaves the connection usable; a broken
                     // connection shows up in the refresh below.
@@ -177,10 +181,7 @@ impl Commands {
             tokio::select! {
                 _ = sleep_until(deadline) => return,
                 Some(command) = self.recv() => {
-                    let reply = match command {
-                        MailCommand::MarkRead { reply, .. } | MailCommand::MarkUnread { reply, .. } => reply,
-                    };
-                    let _ = reply.send(Err(anyhow::anyhow!("Gmail is reconnecting; try again shortly")));
+                    command.fail(anyhow::anyhow!("Gmail is reconnecting; try again shortly"));
                 }
             }
         }

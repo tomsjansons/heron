@@ -215,6 +215,8 @@ pub fn map_event(
         all_day,
         color,
         url: event.html_link,
+            meeting_url: None,
+            details: None,
     })
 }
 

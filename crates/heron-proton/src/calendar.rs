@@ -428,6 +428,8 @@ fn to_occurrences(events: &[(ApiEvent, VEvent)], account: &str, member: &Member,
                 all_day: vevent.all_day(),
                 color: member.color.clone(),
                 url: Some(event_url(&api.calendar_id, &api.id, recurrence_id)),
+            meeting_url: None,
+            details: None,
             });
         }
     }

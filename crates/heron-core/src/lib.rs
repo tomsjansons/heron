@@ -4,6 +4,8 @@
 
 pub mod config;
 pub mod hub;
+pub mod mailbody;
+pub mod meeting;
 pub mod paths;
 pub mod secrets;
 
@@ -30,6 +32,8 @@ pub struct Snapshot {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MailAccount {
     pub id: String,
+    /// Short name for the bar: the config's `label`, else the id.
+    pub label: String,
     pub provider: Provider,
     /// Unread and received after the account's last acknowledgement.
     pub new: u32,
@@ -55,7 +59,8 @@ pub struct Message {
     /// Unix seconds.
     pub received: i64,
     pub unread: bool,
-    /// Computed by the hub; providers leave it false.
+    /// Computed by the hub from acknowledgements and per-message seen/unseen
+    /// marks; providers leave it false.
     #[serde(default)]
     pub new: bool,
     /// Opens the message in the provider's web client.
@@ -79,6 +84,46 @@ pub struct CalendarEvent {
     /// Hex color, such as "#7986cb".
     pub color: Option<String>,
     pub url: Option<String>,
+    /// Video call link (Meet, Zoom, Teams, ...), copied when the event is clicked.
+    #[serde(default)]
+    pub meeting_url: Option<String>,
+    /// Only sent by `Request::Event`; the hub strips it from snapshots to
+    /// keep them small.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<EventDetails>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct EventDetails {
+    /// Plain text, trimmed.
+    pub description: Option<String>,
+    pub organizer: Option<String>,
+    /// Names or addresses, organizer excluded.
+    pub attendees: Vec<String>,
+}
+
+/// A message's content, fetched on demand by `Request::Message`. Fetching
+/// never marks the message read.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct MessageBody {
+    pub id: String,
+    pub from: String,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    /// Unix seconds.
+    pub date: i64,
+    pub subject: String,
+    /// Plain text: the text/plain part, or the HTML part converted to text.
+    pub text: String,
+    /// Links found in the message, in order, without duplicates.
+    pub links: Vec<Link>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Link {
+    /// The anchor text, or the URL itself when there is none.
+    pub text: String,
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -86,6 +131,12 @@ pub struct DiscordGuild {
     pub id: String,
     pub name: String,
     pub unread_channels: u32,
+    /// Unread messages across visible, unmuted channels (each channel counts
+    /// at most [`DISCORD_UNREAD_CAP`]).
+    #[serde(default)]
+    pub unread_messages: u32,
+    /// Unread messages that notify the user: direct @mentions, replies that
+    /// ping them, @everyone/@here and role mentions (when not suppressed).
     pub mentions: u32,
     /// Unread channels only, most mentions first.
     pub channels: Vec<DiscordChannel>,
@@ -95,8 +146,37 @@ pub struct DiscordGuild {
 pub struct DiscordChannel {
     pub id: String,
     pub name: String,
+    /// Unread messages, at most [`DISCORD_UNREAD_CAP`].
+    #[serde(default)]
+    pub unread: u32,
+    /// True when there are more unread messages than `unread` says.
+    #[serde(default)]
+    pub more: bool,
     pub mentions: u32,
     pub url: String,
+    /// The newest unread messages, oldest first, at most
+    /// [`DISCORD_PREVIEW_MESSAGES`].
+    #[serde(default)]
+    pub messages: Vec<DiscordMessage>,
+}
+
+/// Unread messages counted per channel before reporting `more`.
+pub const DISCORD_UNREAD_CAP: u32 = 100;
+/// Messages previewed per unread channel.
+pub const DISCORD_PREVIEW_MESSAGES: usize = 3;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DiscordMessage {
+    pub id: String,
+    /// Display name.
+    pub author: String,
+    /// Plain text, at most 200 characters; mentions resolved to names,
+    /// attachments as "[image]" and similar.
+    pub content: String,
+    /// Unix seconds.
+    pub timestamp: i64,
+    /// This message notifies the user (mention, reply ping, @everyone, role).
+    pub mentions_me: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -141,6 +221,14 @@ pub enum Request {
     Ack { account: Option<String> },
     MarkRead { account: String, id: String },
     MarkUnread { account: String, id: String },
+    /// Clear "new" for one message, leaving it unread.
+    MarkSeen { account: String, id: String },
+    /// Make one message "new" again, until marked seen.
+    MarkUnseen { account: String, id: String },
+    /// Fetch one message's content without marking it read.
+    Message { account: String, id: String },
+    /// One calendar event with its details.
+    Event { id: String },
     /// Re-read the config and restart every provider.
     Reload,
 }
@@ -150,6 +238,8 @@ pub enum Request {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
     Snapshot(Snapshot),
+    Message(MessageBody),
+    Event(CalendarEvent),
     Ok,
     Error { message: String },
 }

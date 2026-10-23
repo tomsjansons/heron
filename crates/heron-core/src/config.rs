@@ -8,7 +8,7 @@
 //! [[google]]
 //! id = "personal"
 //! email = "me@gmail.com"
-//! # calendars = ["primary"]     # default: every calendar shown in Google Calendar
+//! # calendars = ["primary", "team@group.calendar.google.com"]   # default: primary only
 //!
 //! [[proton]]
 //! id = "proton"
@@ -43,6 +43,8 @@ pub struct Config {
 pub struct ProtonAccount {
     /// Account id used in the snapshot, CLI and credential file names.
     pub id: String,
+    /// Short name shown in the bar. Defaults to the id.
+    pub label: Option<String>,
     pub username: String,
     #[serde(default = "yes")]
     pub mail: bool,
@@ -54,13 +56,16 @@ pub struct ProtonAccount {
 #[serde(deny_unknown_fields)]
 pub struct GoogleAccount {
     pub id: String,
+    /// Short name shown in the bar. Defaults to the id.
+    pub label: Option<String>,
     /// Expected address; `heron auth google` refuses a login as anyone else.
     pub email: String,
     #[serde(default = "yes")]
     pub mail: bool,
     #[serde(default = "yes")]
     pub calendar: bool,
-    /// Calendar ids to include. `None` means every selected calendar.
+    /// Calendar ids to include. `None` means only the primary calendar,
+    /// which holds your own events and the invitations you accepted.
     pub calendars: Option<Vec<String>>,
 }
 
@@ -119,6 +124,13 @@ fn yes() -> bool {
 }
 
 impl Config {
+    /// Account id → label, for every mail account.
+    pub fn labels(&self) -> std::collections::BTreeMap<String, String> {
+        let proton = self.proton.iter().map(|a| (a.id.clone(), a.label.clone().unwrap_or_else(|| a.id.clone())));
+        let google = self.google.iter().map(|a| (a.id.clone(), a.label.clone().unwrap_or_else(|| a.id.clone())));
+        proton.chain(google).collect()
+    }
+
     /// Reads the config file. A missing file is an empty config.
     pub fn load() -> Result<Self> {
         let path = paths::config_file();
