@@ -184,7 +184,8 @@ fn print_status(snapshot: &Snapshot) {
         println!("  {}", style.dim("nothing scheduled"));
     }
     for event in snapshot.calendar.iter().take(10) {
-        println!("  {}  {}  {}", when(event.start, event.all_day), truncate(&event.title, 50), style.dim(&event.calendar));
+        let time = if event.start <= heron_core::now() { until(event.end, event.all_day) } else { when(event.start, event.all_day) };
+        println!("  {}  {}  {}", time, truncate(&event.title, 50), style.dim(&event.calendar));
     }
 
     if let Some(guild) = &snapshot.discord {
@@ -222,6 +223,21 @@ fn when(unix: i64, all_day: bool) -> String {
         _ => zoned.strftime("%a %d %b").to_string(),
     };
     if all_day { format!("{day:<10} {:>5}", "") } else { format!("{day:<10} {}", zoned.strftime("%H:%M")) }
+}
+
+/// "now → 18:00" for an event in progress; the end date when it is not today.
+fn until(end: i64, all_day: bool) -> String {
+    let Ok(ts) = jiff::Timestamp::from_second(end) else { return "now".into() };
+    let zoned = ts.to_zoned(jiff::tz::TimeZone::system());
+    // An all-day event ends at the following midnight; name its last day.
+    let last = if all_day { zoned.saturating_sub(jiff::SignedDuration::from_secs(1)) } else { zoned };
+    let today = jiff::Zoned::now().date();
+    let label = match (all_day, last.date() == today) {
+        (true, true) => "today".to_owned(),
+        (false, true) => last.strftime("%H:%M").to_string(),
+        (_, false) => last.strftime("%a %d %b").to_string(),
+    };
+    format!("{:<16}", format!("now → {label}"))
 }
 
 fn truncate(text: &str, max: usize) -> String {

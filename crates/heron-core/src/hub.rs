@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tracing::warn;
 
 use crate::{
-    CalendarEvent, DiscordGuild, MailAccount, Message, Provider, Snapshot, SourceKind, SourceState,
+    CalendarEvent, DiscordGuild, config::CalendarSettings, MailAccount, Message, Provider, Snapshot, SourceKind, SourceState,
     SourceStatus, now, paths,
 };
 
@@ -43,7 +43,7 @@ pub struct Hub {
 }
 
 struct Inner {
-    days_ahead: u32,
+    calendar: CalendarSettings,
     mail: BTreeMap<String, (Provider, MailUpdate)>,
     calendars: BTreeMap<String, Vec<CalendarEvent>>,
     discord: Option<DiscordGuild>,
@@ -54,9 +54,9 @@ struct Inner {
 }
 
 impl Hub {
-    pub fn new(days_ahead: u32) -> Self {
+    pub fn new(calendar: &CalendarSettings) -> Self {
         let inner = Inner {
-            days_ahead,
+            calendar: calendar.clone(),
             mail: BTreeMap::new(),
             calendars: BTreeMap::new(),
             discord: None,
@@ -73,9 +73,9 @@ impl Hub {
     }
 
     /// Forgets every source, keeping acknowledgements. Used on reload.
-    pub fn reset(&self, days_ahead: u32) {
+    pub fn reset(&self, calendar: &CalendarSettings) {
         let mut inner = self.lock();
-        inner.days_ahead = days_ahead;
+        inner.calendar = calendar.clone();
         inner.mail.clear();
         inner.calendars.clear();
         inner.discord = None;
@@ -203,10 +203,13 @@ impl Inner {
             })
             .collect();
 
-        let horizon = now + i64::from(self.days_ahead) * 86_400;
+        let horizon = now + i64::from(self.calendar.days_ahead) * 86_400;
+        let long = i64::from(self.calendar.long_event_days) * 86_400;
+        // A long event stays visible for the first day after it starts.
+        let is_stale_long = |e: &CalendarEvent| long > 0 && e.end - e.start > long && e.start < now - 86_400;
         let mut calendar: Vec<CalendarEvent> = self.calendars.values()
             .flatten()
-            .filter(|e| e.end > now && e.start < horizon)
+            .filter(|e| e.end > now && e.start < horizon && !is_stale_long(e))
             .cloned()
             .collect();
         calendar.sort_by(|a, b| (a.start, &a.title).cmp(&(b.start, &b.title)));
@@ -264,7 +267,7 @@ mod tests {
     #[test]
     fn new_is_unread_after_ack() {
         let mut inner = Inner {
-            days_ahead: 7,
+            calendar: CalendarSettings::default(),
             mail: BTreeMap::new(),
             calendars: BTreeMap::new(),
             discord: None,
@@ -300,11 +303,19 @@ mod tests {
             url: None,
         };
         let inner = Inner {
-            days_ahead: 1,
+            calendar: CalendarSettings { days_ahead: 1, ..CalendarSettings::default() },
             mail: BTreeMap::new(),
             calendars: BTreeMap::from([(
                 "g".to_owned(),
-                vec![event("later", 2_000, 3_000), event("ended", 0, 500), event("now", 900, 1_100), event("far", 1_000 + 86_400, 90_000)],
+                vec![
+                    event("later", 2_000, 3_000),
+                    event("ended", 0, 500),
+                    event("now", 900, 1_100),
+                    event("far", 1_000 + 86_400, 90_000),
+                    // Longer than 7 days: hidden once it has run a day, shown on its first day.
+                    event("long-stale", 1_000 - 2 * 86_400, 1_000 + 20 * 86_400),
+                    event("long-fresh", 950, 1_000 + 20 * 86_400),
+                ],
             )]),
             discord: None,
             status: BTreeMap::new(),
@@ -312,6 +323,6 @@ mod tests {
             mail_commands: HashMap::new(),
         };
         let ids: Vec<String> = inner.snapshot(1_000).calendar.into_iter().map(|e| e.id).collect();
-        assert_eq!(ids, ["now", "later"]);
+        assert_eq!(ids, ["now", "long-fresh", "later"]);
     }
 }

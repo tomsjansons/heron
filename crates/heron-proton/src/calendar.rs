@@ -181,6 +181,7 @@ async fn sync<P: PGPProviderSync>(
         calendars: Vec<ApiCalendar>,
     }
     let calendars = api.get::<Calendars>("/calendar/v1", &[]).await?.calendars;
+    debug!("proton/{account}: {} calendars", calendars.len());
 
     let mut out = Vec::new();
     for calendar in calendars {
@@ -193,6 +194,7 @@ async fn sync<P: PGPProviderSync>(
         };
         let hidden = member.display.as_ref().is_some_and(|d| d.as_i64() == Some(0) || d.as_bool() == Some(false));
         if hidden || member.flags & UNUSABLE != 0 {
+            debug!("calendar {:?}: skipped (hidden: {hidden}, flags: {})", member.name, member.flags);
             continue;
         }
         let address_keys = &keyring.addresses[member.address_id.as_deref().unwrap_or_default()];
@@ -212,6 +214,7 @@ async fn sync<P: PGPProviderSync>(
         let calendar_keys = &cache[&calendar.id];
 
         let events = fetch_events(api, &calendar.id, timezone, from, to).await?;
+        debug!("calendar {:?}: {} events in window", member.name, events.len());
         let mut decrypted = Vec::with_capacity(events.len());
         let mut failed = 0;
         for event in events {
@@ -259,8 +262,29 @@ fn unlock_calendar<P: PGPProviderSync>(
     Ok(keys)
 }
 
-/// Every event touching the window, through the four query types the web app uses.
+/// Proton answers "Time window is too big" for long ranges, so the window is
+/// queried in chunks of this many seconds.
+const CHUNK: i64 = 30 * 86_400;
+
+/// Every event touching the window, in chunks Proton accepts.
 async fn fetch_events(api: &Api, calendar: &str, timezone: &str, from: i64, to: i64) -> Result<Vec<ApiEvent>> {
+    let mut seen = HashSet::new();
+    let mut events = Vec::new();
+    let mut start = from;
+    while start < to {
+        let end = (start + CHUNK).min(to);
+        for event in fetch_chunk(api, calendar, timezone, start, end).await? {
+            if seen.insert(event.id.clone()) {
+                events.push(event);
+            }
+        }
+        start = end;
+    }
+    Ok(events)
+}
+
+/// Every event touching one chunk, through the four query types the web app uses.
+async fn fetch_chunk(api: &Api, calendar: &str, timezone: &str, from: i64, to: i64) -> Result<Vec<ApiEvent>> {
     #[derive(Deserialize)]
     struct Page {
         #[serde(rename = "Events", default)]

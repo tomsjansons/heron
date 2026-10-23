@@ -27,7 +27,7 @@ async fn main() -> Result<()> {
         .init();
 
     let config = Config::load()?;
-    let hub = Hub::new(config.calendar.days_ahead);
+    let hub = Hub::new(&config.calendar);
     let daemon = Arc::new(Daemon { hub: hub.clone(), providers: Mutex::new(JoinSet::new()) });
     daemon.start(Arc::new(config)).await;
 
@@ -84,7 +84,7 @@ impl Daemon {
         let mut providers = self.providers.lock().await;
         providers.abort_all();
         while providers.join_next().await.is_some() {}
-        self.hub.reset(config.calendar.days_ahead);
+        self.hub.reset(&config.calendar);
 
         for account in &config.proton {
             let (account, config, hub) = (account.clone(), config.clone(), self.hub.clone());

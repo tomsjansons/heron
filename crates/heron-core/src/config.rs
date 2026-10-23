@@ -97,11 +97,15 @@ pub struct CalendarSettings {
     pub days_ahead: u32,
     /// Poll interval for calendars without push.
     pub poll_secs: u64,
+    /// Events lasting longer than this many days (project phases, trips) are
+    /// shown only during their first day, not for as long as they run.
+    /// 0 shows them throughout.
+    pub long_event_days: u32,
 }
 
 impl Default for CalendarSettings {
     fn default() -> Self {
-        Self { days_ahead: 7, poll_secs: 300 }
+        Self { days_ahead: 7, poll_secs: 300, long_event_days: 7 }
     }
 }
 

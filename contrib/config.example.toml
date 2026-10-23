@@ -32,3 +32,4 @@ max_messages = 50
 [calendar]
 days_ahead = 7
 poll_secs = 300
+long_event_days = 7           # longer events show only on their first day; 0 = always
