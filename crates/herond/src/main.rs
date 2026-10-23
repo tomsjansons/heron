@@ -42,6 +42,9 @@ async fn main() -> Result<()> {
     let listener = UnixListener::bind(&path).with_context(|| format!("binding {}", path.display()))?;
     info!("listening on {}", path.display());
 
+    // Fetch the newest messages' content ahead so previews open at once.
+    tokio::spawn(hub.clone().prefetch());
+
     // Republish once a minute so events that have ended leave the agenda.
     let ticker = hub.clone();
     tokio::spawn(async move {

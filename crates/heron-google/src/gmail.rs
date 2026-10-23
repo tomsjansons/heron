@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_imap::extensions::idle::IdleResponse;
-use async_imap::imap_proto::Address;
+use async_imap::imap_proto::{Address, BodyStructure, ContentEncoding, SectionPath};
 use async_imap::types::{Fetch, NameAttribute};
 use futures_util::TryStreamExt as _;
 use heron_core::config::GoogleAccount;
@@ -382,21 +382,128 @@ fn format_from(addresses: &[Address<'_>]) -> String {
 }
 
 /// The whole message with `BODY.PEEK[]`, which leaves the `\Seen` flag alone.
+/// Fetches what a preview needs: the header and the first text/plain and
+/// text/html parts, never attachments (a message with an 11 MB attachment
+/// took 20 s to download whole). The parts are reassembled into a small MIME
+/// message for [`mailbody::from_mime`]. PEEK leaves the read state alone.
 async fn fetch_body(worker: &mut Session, id: &str) -> Result<MessageBody> {
     let uid: u32 = id.parse().with_context(|| format!("not a Gmail message id: {id:?}"))?;
+    let gone = || format!("message {uid} is no longer in the INBOX");
+
     let fetched: Vec<Fetch> = within(async {
-        worker.uid_fetch(uid.to_string(), "(UID BODY.PEEK[])").await?.try_collect::<Vec<_>>().await
+        worker.uid_fetch(uid.to_string(), "(UID BODYSTRUCTURE)").await?.try_collect::<Vec<_>>().await
     })
     .await
-    .with_context(|| format!("fetching message {uid}"))?;
-    let raw = fetched.iter()
-        .find(|f| f.uid == Some(uid))
-        .and_then(Fetch::body)
-        .with_context(|| format!("message {uid} is no longer in the INBOX"))?;
-    debug!("gmail: fetched message {uid} ({} bytes)", raw.len());
-    let mut body = mailbody::from_mime(raw).with_context(|| format!("parsing message {uid}"))?;
+    .with_context(|| format!("fetching the structure of message {uid}"))?;
+    let structure = fetched.iter().find(|f| f.uid == Some(uid)).and_then(Fetch::bodystructure).with_context(gone)?;
+    let mut parts = Vec::new();
+    text_parts(structure, &mut Vec::new(), &mut parts);
+
+    let sections: String = parts.iter().map(|p| format!(" BODY.PEEK[{}]", p.section_name())).collect();
+    let query = format!("(UID BODY.PEEK[HEADER]{sections})");
+    let fetched: Vec<Fetch> = within(async { worker.uid_fetch(uid.to_string(), &query).await?.try_collect::<Vec<_>>().await })
+        .await
+        .with_context(|| format!("fetching message {uid}"))?;
+    let fetch = fetched.iter().find(|f| f.uid == Some(uid)).with_context(gone)?;
+    let header = fetch.header().with_context(gone)?;
+    let bodies: Vec<(&TextPart, &[u8])> = parts.iter()
+        .filter_map(|part| Some((part, fetch.section(&SectionPath::Part(part.section.clone(), None))?)))
+        .collect();
+
+    let raw = reassemble(header, &bodies);
+    debug!("gmail: fetched message {uid} ({} of the parts, {} bytes)", bodies.len(), raw.len());
+    let mut body = mailbody::from_mime(&raw).with_context(|| format!("parsing message {uid}"))?;
     body.id = id.to_owned();
     Ok(body)
+}
+
+/// A text part worth previewing.
+#[derive(Debug, Clone, PartialEq)]
+struct TextPart {
+    /// IMAP section number, such as [1, 2] for "1.2".
+    section: Vec<u32>,
+    /// "plain" or "html".
+    subtype: String,
+    charset: Option<String>,
+    encoding: String,
+}
+
+impl TextPart {
+    fn section_name(&self) -> String {
+        self.section.iter().map(u32::to_string).collect::<Vec<_>>().join(".")
+    }
+}
+
+/// Collects the first inline text/plain and text/html parts, depth first.
+/// Attached messages and attachments are skipped.
+fn text_parts(structure: &BodyStructure<'_>, path: &mut Vec<u32>, out: &mut Vec<TextPart>) {
+    match structure {
+        BodyStructure::Multipart { bodies, .. } => {
+            for (n, child) in bodies.iter().enumerate() {
+                path.push(n as u32 + 1);
+                text_parts(child, path, out);
+                path.pop();
+            }
+        }
+        BodyStructure::Text { common, other, .. } => {
+            let subtype = common.ty.subtype.to_ascii_lowercase();
+            let attachment = common.disposition.as_ref().is_some_and(|d| d.ty.eq_ignore_ascii_case("attachment"));
+            if attachment || !(subtype == "plain" || subtype == "html") || out.iter().any(|p| p.subtype == subtype) {
+                return;
+            }
+            let charset = common.ty.params.iter().flatten()
+                .find(|(key, _)| key.eq_ignore_ascii_case("charset"))
+                .map(|(_, value)| value.to_string());
+            // A single-part message's only body is section 1.
+            let section = if path.is_empty() { vec![1] } else { path.clone() };
+            out.push(TextPart { section, subtype, charset, encoding: encoding_name(&other.transfer_encoding) });
+        }
+        BodyStructure::Basic { .. } | BodyStructure::Message { .. } => {}
+    }
+}
+
+fn encoding_name(encoding: &ContentEncoding<'_>) -> String {
+    match encoding {
+        ContentEncoding::SevenBit => "7bit".into(),
+        ContentEncoding::EightBit => "8bit".into(),
+        ContentEncoding::Binary => "binary".into(),
+        ContentEncoding::Base64 => "base64".into(),
+        ContentEncoding::QuotedPrintable => "quoted-printable".into(),
+        ContentEncoding::Other(other) => other.to_string(),
+    }
+}
+
+/// The original header without its MIME structure fields, followed by the
+/// fetched parts as one multipart/alternative body.
+fn reassemble(header: &[u8], parts: &[(&TextPart, &[u8])]) -> Vec<u8> {
+    const BOUNDARY: &str = "heron-preview-boundary";
+    let mut out = Vec::with_capacity(header.len() + parts.iter().map(|(_, b)| b.len() + 128).sum::<usize>());
+    let mut skipping = false;
+    for line in header.split_inclusive(|&b| b == b'\n') {
+        let folded = line.first().is_some_and(|b| *b == b' ' || *b == b'\t');
+        if !folded {
+            let lower = line.to_ascii_lowercase();
+            skipping = [&b"content-type:"[..], b"content-transfer-encoding:", b"mime-version:"].iter().any(|f| lower.starts_with(f));
+            if line.trim_ascii().is_empty() {
+                break; // end of the header block
+            }
+        }
+        if !skipping {
+            out.extend_from_slice(line);
+        }
+    }
+    out.extend_from_slice(format!("MIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=\"{BOUNDARY}\"\r\n\r\n").as_bytes());
+    for (part, body) in parts {
+        let charset = part.charset.as_deref().map(|c| format!("; charset=\"{c}\"")).unwrap_or_default();
+        out.extend_from_slice(
+            format!("--{BOUNDARY}\r\nContent-Type: text/{}{charset}\r\nContent-Transfer-Encoding: {}\r\n\r\n", part.subtype, part.encoding)
+                .as_bytes(),
+        );
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
+    out
 }
 
 /// Moves a message from the INBOX to the mailbox flagged `\Trash`, whose name
@@ -425,6 +532,25 @@ async fn set_seen(worker: &mut Session, id: &str, seen: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reassembles_text_parts_without_attachments() {
+        let header = b"From: Ana <ana@example.com>\r\nSubject: =?UTF-8?Q?R=C4=ABga?=\r\nContent-Type: multipart/mixed;\r\n\tboundary=\"x\"\r\nMIME-Version: 1.0\r\nTo: me@example.com\r\n\r\n";
+        let plain = TextPart { section: vec![1, 1], subtype: "plain".into(), charset: Some("utf-8".into()), encoding: "quoted-printable".into() };
+        let html = TextPart { section: vec![1, 2], subtype: "html".into(), charset: Some("utf-8".into()), encoding: "base64".into() };
+        use base64::Engine as _;
+        let html_body = base64::engine::general_purpose::STANDARD.encode("<p>Hello <a href=\"https://example.com/x\">there</a></p>");
+        let raw = reassemble(header, &[(&plain, b"Hello =C4=ABga, see https://example.com/x"), (&html, html_body.as_bytes())]);
+        let text = String::from_utf8_lossy(&raw);
+        assert!(!text.contains("multipart/mixed"), "original structure header is dropped");
+        assert!(text.contains("To: me@example.com"));
+
+        let body = mailbody::from_mime(&raw).unwrap();
+        assert_eq!(body.subject, "Rīga");
+        assert!(body.text.contains("Hello īga"), "{}", body.text);
+        assert_eq!(body.links.len(), 1);
+        assert_eq!(body.to.len(), 1);
+    }
 
     #[test]
     fn decodes_encoded_words() {

@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tracing::warn;
 
 use crate::{
@@ -77,10 +77,16 @@ impl Seen {
     }
 }
 
+/// Messages per account whose content is fetched ahead, so previews open at
+/// once: as many as the shell plugin lists (`heron watch --messages 20`).
+const PREFETCH: usize = 20;
+
 #[derive(Clone)]
 pub struct Hub {
     inner: Arc<Mutex<Inner>>,
     tx: Arc<watch::Sender<Snapshot>>,
+    /// Woken when a mail list changes, for [`Hub::prefetch`].
+    lists_changed: Arc<Notify>,
 }
 
 struct Inner {
@@ -92,6 +98,8 @@ struct Inner {
     seen: Seen,
     labels: BTreeMap<String, String>,
     mail_commands: HashMap<String, mpsc::Sender<MailCommand>>,
+    /// Fetched message content by (account, id), for listed messages only.
+    bodies: HashMap<(String, String), MessageBody>,
 }
 
 impl Hub {
@@ -105,9 +113,10 @@ impl Hub {
             seen: load_seen(),
             labels: BTreeMap::new(),
             mail_commands: HashMap::new(),
+            bodies: HashMap::new(),
         };
         let (tx, _) = watch::channel(Snapshot::default());
-        Self { inner: Arc::new(Mutex::new(inner)), tx: Arc::new(tx) }
+        Self { inner: Arc::new(Mutex::new(inner)), tx: Arc::new(tx), lists_changed: Arc::new(Notify::new()) }
     }
 
     pub fn subscribe(&self) -> watch::Receiver<Snapshot> {
@@ -123,6 +132,7 @@ impl Hub {
         inner.discord = None;
         inner.status.clear();
         inner.mail_commands.clear();
+        inner.bodies.clear();
         self.publish(&inner);
     }
 
@@ -161,6 +171,9 @@ impl Hub {
         if changed {
             save_seen(&inner.seen);
         }
+        inner.bodies.retain(|(a, id), _| a != account || listed.contains(id.as_str()));
+        drop(listed);
+        self.lists_changed.notify_one();
         inner.mail.insert(account.to_owned(), (provider, update));
         self.publish(&inner);
     }
@@ -198,9 +211,43 @@ impl Hub {
         self.mail_command(account, |reply| MailCommand::Trash { id: id.to_owned(), reply }).await
     }
 
-    /// Fetches one message's content from its provider.
+    /// One message's content: from the cache, else fetched from its provider.
     pub async fn fetch_message(&self, account: &str, id: &str) -> Result<MessageBody> {
-        self.mail_command(account, |reply| MailCommand::Fetch { id: id.to_owned(), reply }).await
+        let key = (account.to_owned(), id.to_owned());
+        if let Some(body) = self.lock().bodies.get(&key) {
+            return Ok(body.clone());
+        }
+        let body = self.mail_command(account, |reply| MailCommand::Fetch { id: id.to_owned(), reply }).await?;
+        let mut inner = self.lock();
+        let listed = inner.mail.get(account).is_some_and(|(_, u)| u.messages.iter().any(|m| m.id == id));
+        if listed {
+            inner.bodies.insert(key, body.clone());
+        }
+        Ok(body)
+    }
+
+    /// Runs forever, fetching the content of each account's newest messages
+    /// ahead of time, one at a time, whenever a list changes.
+    pub async fn prefetch(self) {
+        loop {
+            self.lists_changed.notified().await;
+            loop {
+                let next = {
+                    let inner = self.lock();
+                    inner.mail.iter().find_map(|(account, (_, update))| {
+                        update.messages.iter().take(PREFETCH)
+                            .find(|m| !inner.bodies.contains_key(&(account.clone(), m.id.clone())))
+                            .map(|m| (account.clone(), m.id.clone()))
+                    })
+                };
+                let Some((account, id)) = next else { break };
+                if let Err(err) = self.fetch_message(&account, &id).await {
+                    // Leave it for an on-demand fetch; retry on the next list change.
+                    tracing::debug!("prefetching {account}/{id}: {err:#}");
+                    break;
+                }
+            }
+        }
     }
 
     /// One upcoming event, with details, by id.
@@ -383,6 +430,7 @@ mod tests {
             seen: Seen { acks: BTreeMap::from([("p".to_owned(), 100)]), ..Seen::default() },
             labels: BTreeMap::new(),
             mail_commands: HashMap::new(),
+            bodies: HashMap::new(),
         };
         let update = MailUpdate {
             unread: 5,
@@ -439,6 +487,7 @@ mod tests {
             seen: Seen::default(),
             labels: BTreeMap::new(),
             mail_commands: HashMap::new(),
+            bodies: HashMap::new(),
         };
         let ids: Vec<String> = inner.snapshot(1_000).calendar.into_iter().map(|e| e.id).collect();
         assert_eq!(ids, ["now", "long-fresh", "later"]);
