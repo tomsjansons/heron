@@ -16,13 +16,6 @@ local TITLE_MAX = 28
 
 local current = heron.read()
 
-local function ellipsize(text, max)
-  if utf8.len(text) == nil or utf8.len(text) <= max then
-    return text
-  end
-  return string.sub(text, 1, utf8.offset(text, max) - 1) .. "…"
-end
-
 local function render()
   local snapshot = heron.snapshot(current)
   barWidget.setGlyph("calendar-event")
@@ -45,7 +38,7 @@ local function render()
 
   local text = noctalia.tr("widget.agenda.event", {
     time = heron.clock(event.start),
-    title = ellipsize(event.title, TITLE_MAX),
+    title = heron.ellipsize(event.title, TITLE_MAX),
   })
   barWidget.setGlyphColor((ongoing or event.start - now <= 15 * 60) and "primary" or "on_surface")
   barWidget.setText(text)

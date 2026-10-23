@@ -2,8 +2,9 @@
 #
 # One [[service]] (`sync`) holds `heron watch` open and republishes every
 # snapshot on the "heron" noctalia.state key. The bar widgets and panels are
-# thin clients of that value; they shell out to `heron` only for actions
-# (ack, mark-read, mark-unread) and to `xdg-open` for links.
+# thin clients of that value; they shell out to `heron` for actions (ack,
+# mark-read/unread, mark-seen/unseen), for on-demand content (`heron message`,
+# `heron event`) and to `xdg-open` for links.
 #
 # plugin_api 24: require() modules (22) and the argv form of runAsync (24),
 # which also covers timeFormat (19) and nowMs (12).
@@ -47,18 +48,27 @@ max             = 120
 id    = "sync"
 entry = "sync.luau"
 
-# "(N) new; (M) unread". Click toggles the inbox panel.
+# "proton 2/63 · work 0/55" (new/unread per account label), or "2/63" for the
+# one account named in this instance's `account` setting. Click toggles the
+# inbox panel.
 [[widget]]
 id    = "mail"
 entry = "mail.luau"
+
+[[widget.setting]]
+key             = "account"
+type            = "string"
+label_key       = "settings.account.label"
+description_key = "settings.account.description"
+default         = ""
 
 # "14:00 Standup" / "now · Standup". Click toggles the calendar panel.
 [[widget]]
 id    = "agenda"
 entry = "agenda.luau"
 
-# Unread channel count, "@N" with mentions. Click toggles the channels panel,
-# right click opens the server.
+# "12 · @3": unread messages and notifying ones ("100+" when a channel's count
+# is capped). Click toggles the channels panel, right click opens the server.
 [[widget]]
 id    = "discord"
 entry = "discord.luau"
@@ -66,23 +76,23 @@ entry = "discord.luau"
 [[panel]]
 id              = "inbox"
 entry           = "inbox.luau"
-width           = 600
-height          = 460
+width           = 640
+height          = 620
 placement       = "attached"
 open_near_click = true
 
 [[panel]]
 id              = "calendar"
 entry           = "calendar.luau"
-width           = 480
-height          = 480
+width           = 500
+height          = 560
 placement       = "attached"
 open_near_click = true
 
 [[panel]]
 id              = "channels"
 entry           = "channels.luau"
-width           = 380
-height          = 400
+width           = 460
+height          = 560
 placement       = "attached"
 open_near_click = true

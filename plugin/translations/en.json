@@ -11,6 +11,10 @@
     "reminder_minutes": {
       "label": "Event reminder (minutes)",
       "description": "Notify this many minutes before a calendar event starts. 0 turns reminders off."
+    },
+    "account": {
+      "label": "Account",
+      "description": "Show only this mail account (its id or label from herond's config) as \"new/unread\". Empty shows every account."
     }
   },
   "counts": {
@@ -50,7 +54,8 @@
   "widget": {
     "mail": {
       "account": "{new} new, {unread} unread",
-      "empty": "No mail accounts configured"
+      "empty": "No mail accounts configured",
+      "missing": "No mail account '{account}' in herond"
     },
     "agenda": {
       "event": "{time} - {title}",
@@ -58,13 +63,15 @@
     },
     "discord": {
       "none": "No Discord server configured",
-      "tooltip": "{name}: {channels} unread channels, {mentions} mentions"
+      "tooltip": "{name}: {messages} unread messages in {channels} channels, {mentions} notifying you"
     }
   },
   "panel": {
     "refresh": "Reconnect to herond",
     "close": "Close",
-    "render_error": "RENDER ERROR"
+    "render_error": "RENDER ERROR",
+    "loading": "Loading…",
+    "retry": "Retry"
   },
   "inbox": {
     "title": "Inbox",
@@ -72,7 +79,25 @@
     "mark_unread": "Mark unread",
     "account_counts": "{new} new · {unread} unread",
     "account_empty": "No unread mail",
-    "no_accounts": "No mail accounts configured in herond."
+    "no_accounts": "No mail accounts configured in herond.",
+    "summary": "{new} new · {unread} unread",
+    "tab_tooltip": "{account} ({provider}): {new} new, {unread} unread",
+    "mark_seen": "Mark seen",
+    "mark_unseen": "Mark unseen",
+    "seen_tooltip": "\"New\" is the shell's own flag (the dot and the bar count); it does not change read state on the server",
+    "open_browser": "Open in browser",
+    "back": "Back",
+    "state_new": "new",
+    "state_unread": "unread",
+    "state_read": "read",
+    "no_subject": "(no subject)",
+    "from": "From",
+    "to": "To",
+    "cc": "Cc",
+    "date": "Date",
+    "body_failed": "Could not load the message: {message}",
+    "no_text": "(no text content)",
+    "links": "LINKS ({count})"
   },
   "calendar": {
     "title": "Agenda",
@@ -84,13 +109,22 @@
     "summary": {
       "one": "{count} upcoming event",
       "other": "{count} upcoming events"
-    }
+    },
+    "link_copied": "Meeting link copied",
+    "details_failed": "Could not load details: {message}",
+    "organizer": "Organizer: {name}",
+    "join": "Join",
+    "copy_link": "Copy link",
+    "open_in_calendar": "Open in calendar",
+    "no_details": "No details"
   },
   "channels": {
     "title": "Discord",
-    "summary": "{channels} unread · {mentions} mentions",
+    "summary": "{messages} unread in {channels} channels · @{mentions}",
     "empty": "All caught up",
-    "open_server": "Open server"
+    "open_server": "Open server",
+    "unread": "{count}",
+    "no_text": "(no text)"
   },
   "notify": {
     "action_failed": "heron {action} failed",
@@ -100,5 +134,12 @@
     },
     "more": "and {count} more",
     "event_soon": "{title} in {minutes} min"
+  },
+  "error": {
+    "timed_out": "timed out",
+    "exit_code": "exited with code {code}"
+  },
+  "list": {
+    "more": "{items} and {count} more"
   }
 }

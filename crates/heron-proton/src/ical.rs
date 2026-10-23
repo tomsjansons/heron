@@ -71,6 +71,68 @@ pub struct VEvent {
     pub rrule: Option<String>,
     pub exdates: Vec<Time>,
     pub recurrence_id: Option<Time>,
+    /// DESCRIPTION, with line breaks kept.
+    pub description: Option<String>,
+    pub organizer: Option<Person>,
+    /// ATTENDEE properties of every part, without duplicates.
+    pub attendees: Vec<Person>,
+    /// Links from [`CONFERENCE_PROPERTIES`] with the property's rank, kept
+    /// in rank order; see [`VEvent::conference_urls`].
+    pub(crate) conference: Vec<(usize, String)>,
+}
+
+/// Properties that may carry a video call link, most specific first:
+/// Proton's own, Google's and Microsoft's, RFC 7986 `CONFERENCE`, and `URL`.
+const CONFERENCE_PROPERTIES: [&str; 7] = [
+    "X-PM-CONFERENCE-URL",
+    "X-GOOGLE-CONFERENCE",
+    "X-MICROSOFT-SKYPETEAMSMEETINGURL",
+    "X-MICROSOFT-ONLINEMEETINGCONFLINK",
+    "X-MICROSOFT-ONLINEMEETINGEXTERNALLINK",
+    "CONFERENCE",
+    "URL",
+];
+
+/// An ORGANIZER or ATTENDEE.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Person {
+    /// CN, when it is not just the address again.
+    pub name: Option<String>,
+    /// From `mailto:`, or the EMAIL parameter; lowercase.
+    pub email: Option<String>,
+    /// PARTSTAT, uppercase.
+    pub partstat: Option<String>,
+    /// CUTYPE, uppercase: ROOM and RESOURCE are not people.
+    pub cutype: Option<String>,
+    /// Proton's `X-PM-TOKEN`, which keys the attendee's answer in the clear
+    /// `AttendeesInfo`.
+    pub token: Option<String>,
+}
+
+impl Person {
+    fn parse(prop: &Property) -> Self {
+        let value = prop.value.trim();
+        let mailto = value.get(..7).filter(|p| p.eq_ignore_ascii_case("mailto:")).map(|_| &value[7..]);
+        let email = mailto.or(prop.param("EMAIL")).map(|e| e.trim().to_ascii_lowercase()).filter(|e| !e.is_empty());
+        let name = prop.param("CN").map(|n| unescape(n, false))
+            .filter(|n| !n.is_empty() && Some(n.to_ascii_lowercase()) != email);
+        Person {
+            name,
+            email,
+            partstat: prop.param("PARTSTAT").map(str::to_ascii_uppercase),
+            cutype: prop.param("CUTYPE").map(str::to_ascii_uppercase),
+            token: prop.param("X-PM-TOKEN").map(str::to_owned),
+        }
+    }
+
+    /// The name, else the address.
+    pub fn label(&self) -> Option<String> {
+        self.name.clone().or_else(|| self.email.clone())
+    }
+
+    pub fn is_resource(&self) -> bool {
+        matches!(self.cutype.as_deref(), Some("ROOM" | "RESOURCE"))
+    }
 }
 
 impl VEvent {
@@ -117,8 +179,26 @@ impl VEvent {
             let is_date = prop.param("VALUE").is_some_and(|v| v.eq_ignore_ascii_case("DATE"));
             match prop.name.as_str() {
                 "UID" => self.uid = Some(prop.value.clone()),
-                "SUMMARY" => self.summary = Some(unescape(&prop.value)),
-                "LOCATION" => self.location = Some(unescape(&prop.value)),
+                "SUMMARY" => self.summary = Some(unescape(&prop.value, false)),
+                "LOCATION" => self.location = Some(unescape(&prop.value, false)),
+                "DESCRIPTION" => self.description = Some(unescape(&prop.value, true)),
+                "ORGANIZER" => self.organizer = Some(Person::parse(&prop)),
+                "ATTENDEE" => {
+                    let person = Person::parse(&prop);
+                    match self.attendees.iter_mut().find(|a| a.email.is_some() && a.email == person.email) {
+                        Some(known) => *known = person,
+                        None => self.attendees.push(person),
+                    }
+                }
+                name if CONFERENCE_PROPERTIES.contains(&name) => {
+                    let rank = CONFERENCE_PROPERTIES.iter().position(|p| *p == name).unwrap_or_default();
+                    let url = unescape(&prop.value, false);
+                    let url = url.strip_prefix("conf:").unwrap_or(&url).trim().to_owned();
+                    if !url.is_empty() && !self.conference.iter().any(|(_, u)| *u == url) {
+                        let at = self.conference.iter().position(|&(r, _)| r > rank).unwrap_or(self.conference.len());
+                        self.conference.insert(at, (rank, url));
+                    }
+                }
                 "STATUS" => self.status = Some(prop.value.to_ascii_uppercase()),
                 "DTSTART" => self.start = Time::parse(&prop.value, tzid, is_date),
                 "DTEND" => self.end = Time::parse(&prop.value, tzid, is_date),
@@ -137,6 +217,13 @@ impl VEvent {
 
     pub fn cancelled(&self) -> bool {
         self.status.as_deref() == Some("CANCELLED")
+    }
+
+    /// Links from conference properties with the property's name, most
+    /// specific first. They are not checked to be video calls (`URL` often
+    /// is not).
+    pub fn conference_urls(&self) -> impl Iterator<Item = (&'static str, &str)> {
+        self.conference.iter().map(|(rank, url)| (CONFERENCE_PROPERTIES[*rank], url.as_str()))
     }
 }
 
@@ -267,8 +354,9 @@ impl Property {
     }
 }
 
-/// TEXT value escapes: `\\`, `\;`, `\,`, `\n`.
-fn unescape(value: &str) -> String {
+/// TEXT value escapes: `\\`, `\;`, `\,`, `\n`. Line breaks become spaces
+/// unless `newlines`.
+fn unescape(value: &str, newlines: bool) -> String {
     let mut out = String::with_capacity(value.len());
     let mut chars = value.chars();
     while let Some(c) = chars.next() {
@@ -277,7 +365,7 @@ fn unescape(value: &str) -> String {
             continue;
         }
         match chars.next() {
-            Some('n' | 'N') => out.push(' '),
+            Some('n' | 'N') => out.push(if newlines { '\n' } else { ' ' }),
             Some(other) => out.push(other),
             None => {}
         }
@@ -425,6 +513,40 @@ mod tests {
         let event = VEvent::from_parts([text]);
         assert_eq!(event.recurrence_id.and_then(Time::timestamp), Some(ts("2026-10-22T09:00:00+03:00")));
         assert!(event.cancelled());
+    }
+
+    #[test]
+    fn reads_people_description_and_conference() {
+        let shared = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:x\r\nDTSTART:20261025T120000Z\r\n\
+            ORGANIZER;CN=Jane Doe:mailto:Jane@Example.com\r\n\
+            DESCRIPTION:Agenda:\\n- one\\, two\\;\\n\\nJoin: https://meet.google.com/abc-defg-hij\r\n\
+            URL:https://example.com/info\r\n\
+            X-PM-CONFERENCE-ID;X-PM-PROVIDER=2:id-abc\r\n\
+            X-PM-CONFERENCE-URL:https://meet.proton.me/join/id-abc#pwd-x\r\n\
+            END:VEVENT\r\nEND:VCALENDAR";
+        let attendees = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:x\r\n\
+            ATTENDEE;CN=me@proton.me;PARTSTAT=NEEDS-ACTION;X-PM-TOKEN=t1:mailto:me@proton.me\r\n\
+            ATTENDEE;CN=\"Bob, B\";ROLE=REQ-PARTICIPANT;X-PM-TOKEN=t2:mailto:bob@x.com\r\n\
+            ATTENDEE;CUTYPE=ROOM;CN=Room 1:mailto:room@x.com\r\n\
+            END:VEVENT\r\nEND:VCALENDAR";
+        let event = VEvent::from_parts([shared, attendees]);
+        assert_eq!(event.description.as_deref(), Some("Agenda:\n- one, two;\n\nJoin: https://meet.google.com/abc-defg-hij"));
+        let organizer = event.organizer.as_ref().unwrap();
+        assert_eq!((organizer.name.as_deref(), organizer.email.as_deref()), (Some("Jane Doe"), Some("jane@example.com")));
+        assert_eq!(organizer.label().as_deref(), Some("Jane Doe"));
+
+        assert_eq!(event.attendees.len(), 3);
+        let me = &event.attendees[0];
+        assert_eq!((me.name.as_deref(), me.label().as_deref()), (None, Some("me@proton.me")));
+        assert_eq!((me.partstat.as_deref(), me.token.as_deref()), (Some("NEEDS-ACTION"), Some("t1")));
+        assert_eq!(event.attendees[1].label().as_deref(), Some("Bob, B"));
+        assert!(event.attendees[2].is_resource());
+
+        let urls: Vec<(&str, &str)> = event.conference_urls().collect();
+        assert_eq!(urls, [("X-PM-CONFERENCE-URL", "https://meet.proton.me/join/id-abc#pwd-x"), ("URL", "https://example.com/info")]);
+
+        let google = VEvent::from_parts(["BEGIN:VEVENT\r\nX-GOOGLE-CONFERENCE:https://meet.google.com/xyz-abcd-efg\r\nEND:VEVENT"]);
+        assert_eq!(google.conference_urls().collect::<Vec<_>>(), [("X-GOOGLE-CONFERENCE", "https://meet.google.com/xyz-abcd-efg")]);
     }
 
     #[test]

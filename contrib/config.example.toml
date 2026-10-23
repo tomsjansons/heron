@@ -11,13 +11,14 @@ client_secret = "GOCSPX-..."
 
 [[google]]
 id = "personal"
+label = "gmail"               # short name in the bar; defaults to the id
 email = "me@gmail.com"
 
 [[google]]
 id = "work"
 email = "me@company.com"
 mail = false                  # calendar only
-# calendars = ["primary"]     # default: calendars ticked in Google Calendar
+# calendars = ["primary", "team@group.calendar.google.com"]   # default: primary only
 
 [[proton]]
 id = "proton"

@@ -12,7 +12,8 @@
 --     updated  = number,           -- unix seconds of the last change
 --   }
 --
--- Actions (open, mark read, ack) run directly from the entry that needs them,
+-- Actions (open, mark read/unread/seen/unseen, ack) and on-demand fetches
+-- (`heron message`, `heron event`) run directly from the entry that needs them,
 -- with the argv form of runAsync, so nothing goes through a shell.
 
 local M = {}
@@ -23,6 +24,10 @@ M.STATE_KEY = "heron"
 M.COMMAND_KEY = "heron.command"
 -- Panels write a fresh number here to make the service reconnect now.
 M.RECONNECT_KEY = "heron.reconnect"
+
+-- The inbox panel's selected account tab (an account id), remembered across
+-- openings; the mail widget sets it to its own account before opening.
+M.INBOX_TAB_KEY = "heron.inbox.tab"
 
 M.PANEL_INBOX = "toms/heron:inbox"
 M.PANEL_CALENDAR = "toms/heron:calendar"
@@ -49,8 +54,43 @@ local function num(value)
   return 0
 end
 
+-- Index-based on purpose: two gsub passes over a 40 KB snapshot line blew the
+-- stream callback's CPU budget (json.decode of the same line costs ~2 ms).
 function M.trim(text)
-  return (string.gsub(text or "", "^%s+", ""):gsub("%s+$", ""))
+  text = text or ""
+  local first = string.find(text, "%S")
+  if not first then
+    return ""
+  end
+  local last = #text
+  while last > first do
+    local byte = string.byte(text, last)
+    if byte == 32 or (byte >= 9 and byte <= 13) then
+      last -= 1
+    else
+      break
+    end
+  end
+  if first == 1 and last == #text then
+    return text
+  end
+  return string.sub(text, first, last)
+end
+
+-- Cuts `text` to at most `max` characters, adding "…" when it was longer.
+-- Byte-safe for invalid UTF-8 (falls back to bytes).
+function M.ellipsize(text, max)
+  if #text <= max then
+    return text
+  end
+  local length = utf8.len(text)
+  if length == nil then
+    return string.sub(text, 1, max) .. "…"
+  end
+  if length <= max then
+    return text
+  end
+  return string.sub(text, 1, utf8.offset(text, max + 1) - 1) .. "…"
 end
 
 -- Single-quote a string for /bin/sh.
@@ -125,6 +165,54 @@ function M.run(args, onDone)
   return started
 end
 
+-- Runs `heron <args...>` for a command that prints one JSON object
+-- (`message ... --json`, `event ... --json`). Calls onDone(decoded, nil) on
+-- success and onDone(nil, reason) on failure, where reason comes from a
+-- `{"type":"error"}` reply, stderr, or the exit status. No notification: the
+-- caller shows the error inline. Decoding happens in this runAsync callback, not
+-- in the sync service's stream callback, so a large body costs only this call.
+function M.runJson(args, onDone, timeoutMs)
+  local argv = { M.command() }
+  for _, arg in ipairs(args) do
+    argv[#argv + 1] = arg
+  end
+  local started = noctalia.runAsync(argv, function(result)
+    if result.timedOut then
+      onDone(nil, noctalia.tr("error.timed_out"))
+      return
+    end
+    local out = M.trim(result.stdout)
+    local decoded = nil
+    if string.sub(out, 1, 1) == "{" then
+      local newline = string.find(out, "\n", 1, true)
+      local line = newline and string.sub(out, 1, newline - 1) or out
+      local ok, value = pcall(noctalia.json.decode, line)
+      if ok and type(value) == "table" then
+        decoded = value
+      end
+    end
+    if decoded and decoded.type == "error" then
+      onDone(nil, type(decoded.message) == "string" and decoded.message or out)
+    elseif decoded and result.exitCode == 0 then
+      onDone(decoded, nil)
+    else
+      local reason = M.trim(result.stderr)
+      if reason == "" then
+        reason = out
+      end
+      reason = string.gsub(reason, "^Error:%s*", "")
+      if reason == "" then
+        reason = noctalia.tr("error.exit_code", { code = result.exitCode })
+      end
+      onDone(nil, M.ellipsize(reason, 300))
+    end
+  end, timeoutMs or 30000)
+  if not started then
+    onDone(nil, noctalia.tr("status.command_missing", { command = M.command() }))
+  end
+  return started
+end
+
 -- Fire-and-forget xdg-open. Only http(s) and mailto links are opened.
 function M.openUrl(url)
   if type(url) ~= "string" then
@@ -186,6 +274,8 @@ local function normalizeMessage(raw)
 end
 
 local function normalizeAccount(raw)
+  local id = str(raw.id) or ""
+  local label = str(raw.label) or ""
   local messages = {}
   if type(raw.messages) == "table" then
     for _, message in ipairs(raw.messages) do
@@ -195,7 +285,8 @@ local function normalizeAccount(raw)
     end
   end
   return {
-    id = str(raw.id) or "",
+    id = id,
+    label = label ~= "" and label or id,
     provider = str(raw.provider) or "",
     new = num(raw.new),
     unread = num(raw.unread),
@@ -215,7 +306,36 @@ local function normalizeEvent(raw)
     all_day = raw.all_day == true,
     color = str(raw.color) or "",
     url = str(raw.url) or "",
+    meeting_url = str(raw.meeting_url) or "",
   }
+end
+
+-- Discord previews: at most this many per channel and this many channels, so a
+-- busy server cannot blow the sync callback's budget or the panel's row count.
+local DISCORD_PREVIEWS = 3
+local DISCORD_CHANNELS = 30
+local DISCORD_CONTENT_MAX = 200
+
+local function normalizeDiscordMessages(raw)
+  local out = {}
+  if type(raw) ~= "table" then
+    return out
+  end
+  -- Oldest first from herond; keep the newest DISCORD_PREVIEWS.
+  local first = math.max(1, #raw - DISCORD_PREVIEWS + 1)
+  for index = first, #raw do
+    local message = raw[index]
+    if type(message) == "table" then
+      out[#out + 1] = {
+        id = str(message.id) or "",
+        author = str(message.author) or "",
+        content = M.ellipsize(str(message.content) or "", DISCORD_CONTENT_MAX),
+        timestamp = num(message.timestamp),
+        mentions_me = message.mentions_me == true,
+      }
+    end
+  end
+  return out
 end
 
 local function normalizeDiscord(raw)
@@ -223,22 +343,38 @@ local function normalizeDiscord(raw)
     return nil
   end
   local channels = {}
+  local unread = 0
+  local more = false
   if type(raw.channels) == "table" then
     for _, channel in ipairs(raw.channels) do
+      if #channels >= DISCORD_CHANNELS then
+        break
+      end
       if type(channel) == "table" then
-        channels[#channels + 1] = {
+        local entry = {
           id = str(channel.id) or "",
           name = str(channel.name) or "",
+          unread = num(channel.unread),
+          more = channel.more == true,
           mentions = num(channel.mentions),
           url = str(channel.url) or "",
+          messages = normalizeDiscordMessages(channel.messages),
         }
+        channels[#channels + 1] = entry
+        unread += entry.unread
+        more = more or entry.more
       end
     end
   end
+  local unreadMessages = num(raw.unread_messages)
   return {
     id = str(raw.id) or "",
     name = str(raw.name) or "",
     unread_channels = num(raw.unread_channels),
+    -- herond before unread counts: fall back to the per-channel sum.
+    unread_messages = unreadMessages > 0 and unreadMessages or unread,
+    -- Some channel has more unread messages than its (capped) count says.
+    more = more,
     mentions = num(raw.mentions),
     channels = channels,
   }
@@ -391,6 +527,41 @@ function M.nextEvent(snapshot, now, horizon)
     end
   end
   return nil, false
+end
+
+-- A JSON field that should be a string, else "".
+function M.str(value)
+  return str(value) or ""
+end
+
+-- A JSON field that should be a list of strings, else {}.
+function M.strList(value)
+  local out = {}
+  if type(value) == "table" then
+    for _, item in ipairs(value) do
+      if type(item) == "string" and item ~= "" then
+        out[#out + 1] = item
+      end
+    end
+  end
+  return out
+end
+
+-- "a, b, c and 4 more" for at most `max` items.
+function M.joinList(items, max)
+  if #items <= max then
+    return table.concat(items, ", ")
+  end
+  local shown = table.move(items, 1, max, 1, {})
+  return noctalia.tr("list.more", { items = table.concat(shown, ", "), count = #items - max })
+end
+
+-- Unread count as shown: "100+" when the count is capped.
+function M.countText(count, more)
+  if more then
+    return tostring(count) .. "+"
+  end
+  return tostring(count)
 end
 
 -- Asks the service to reconnect, which re-reads the snapshot right away and

@@ -2,10 +2,14 @@
 //!
 //! Uses the owner's own user token. Nothing is ever sent that changes state
 //! on Discord: no messages, no acks, no presence changes. One gateway
-//! connection per daemon run, no REST polling.
+//! connection per daemon run, no REST polling: message history is fetched
+//! once per unread channel (as opening it in the client would) and then kept
+//! current from gateway events.
 
 mod client;
 mod gateway;
+mod history;
+mod messages;
 mod permissions;
 mod state;
 
@@ -68,6 +72,9 @@ pub async fn run(config: DiscordConfig, hub: Hub) -> Result<()> {
 
     status(SourceState::Connecting, None);
     let (tx, mut rx) = mpsc::channel(1024);
+    let (fetch_tx, fetch_rx) = mpsc::unbounded_channel();
+    let (history_tx, mut history_rx) = mpsc::channel(64);
+    let _history = AbortOnDrop(tokio::spawn(history::run(credentials.token.clone(), guild_id, fetch_rx, history_tx)));
     let mut gateway = AbortOnDrop(tokio::spawn(gateway::run(credentials.token, guild_id, tx)));
     let mut guild = GuildState::new(guild_id);
     let mut publish_at: Option<Instant> = None;
@@ -93,11 +100,22 @@ pub async fn run(config: DiscordConfig, hub: Hub) -> Result<()> {
                 Some(Event::Disconnected(reason)) => status(SourceState::Error, Some(reason)),
                 None => break,
             },
+            Some(history::History { channel_id, result }) = history_rx.recv() => {
+                if guild.load_history(channel_id, result, jiff::Timestamp::now()) {
+                    publish_at.get_or_insert_with(|| Instant::now() + DEBOUNCE);
+                }
+            }
             _ = async { sleep_until(publish_at.unwrap_or_else(Instant::now)).await }, if publish_at.is_some() => {
                 publish_at = None;
-                hub.set_discord(guild.snapshot(jiff::Timestamp::now()));
+                let now = jiff::Timestamp::now();
+                request_history(&mut guild, &fetch_tx, now);
+                hub.set_discord(guild.snapshot(now));
             }
-            _ = refresh.tick() => hub.set_discord(guild.snapshot(jiff::Timestamp::now())),
+            _ = refresh.tick() => {
+                let now = jiff::Timestamp::now();
+                request_history(&mut guild, &fetch_tx, now);
+                hub.set_discord(guild.snapshot(now));
+            }
         }
     }
 
@@ -111,6 +129,14 @@ pub async fn run(config: DiscordConfig, hub: Hub) -> Result<()> {
             Ok(())
         }
         Stop::Closed => anyhow::bail!("discord gateway stopped"),
+    }
+}
+
+/// Queues history fetches for unread channels whose messages are unknown.
+fn request_history(guild: &mut GuildState, fetch_tx: &mpsc::UnboundedSender<u64>, now: jiff::Timestamp) {
+    for channel in guild.take_fetches(now) {
+        // The fetcher only stops with the provider.
+        let _ = fetch_tx.send(channel);
     }
 }
 

@@ -23,6 +23,9 @@ local EXIT_MARK = "__heron_exit__"
 -- Messages per account requested from `heron watch`. Noctalia gives each
 -- callback a small CPU budget; a full snapshot (50 per account) overran it.
 local MAX_MESSAGES = 20
+-- Discord channels requested, about 1 KB each with previews. Snapshot lines
+-- over ~65 KB reach runStream in pieces, so the total must stay well below.
+local MAX_CHANNELS = 25
 local BACKOFF_MIN = 2
 local BACKOFF_MAX = 30
 local TICK_IDLE_MS = 15000
@@ -45,7 +48,7 @@ local snapshot = nil
 
 -- Both survive a service reload through noctalia.state, so a reload neither
 -- re-announces mail nor repeats a reminder.
-local seenNew = noctalia.state.get(SEEN_KEY) -- set of "account/id"; nil until the first snapshot
+local seenNew = noctalia.state.get(SEEN_KEY) -- set of listed "account/id"; nil until the first snapshot
 local reminded = noctalia.state.get(REMINDED_KEY) or {} -- event id -> start
 
 local function publish()
@@ -59,21 +62,22 @@ end
 
 -- ── Notifications ────────────────────────────────────────────────────────────
 
+-- Announces messages that are new *and* were not in the previous snapshot at
+-- all. A message that turns new again (mark-unseen from the panel) was already
+-- listed, so pinning it does not raise a notification.
 local function notifyNewMail(current)
   local fresh = {}
-  local nextSeen = {}
+  local nextKnown = {}
   for _, account in ipairs(current.mail) do
     for _, message in ipairs(account.messages) do
-      if message.new then
-        local key = account.id .. "/" .. message.id
-        nextSeen[key] = true
-        if seenNew ~= nil and not seenNew[key] then
-          fresh[#fresh + 1] = message
-        end
+      local key = account.id .. "/" .. message.id
+      nextKnown[key] = true
+      if message.new and seenNew ~= nil and not seenNew[key] then
+        fresh[#fresh + 1] = message
       end
     end
   end
-  seenNew = nextSeen
+  seenNew = nextKnown
   noctalia.state.set(SEEN_KEY, seenNew)
 
   if #fresh == 0 or noctalia.getConfig("notify_mail") == false then
@@ -133,11 +137,13 @@ end
 
 local start -- forward declaration
 
+
 local function scheduleRetry()
   retryAt = heron.now() + backoff
   backoff = math.min(backoff * 2, BACKOFF_MAX)
   noctalia.setUpdateInterval(TICK_RETRY_MS)
 end
+
 
 local function onSnapshot(raw)
   snapshot = heron.normalize(raw)
@@ -191,7 +197,12 @@ local function onLine(gen, line)
     return
   end
   if string.sub(line, 1, 1) == "{" then
-    local decoded = noctalia.json.decode(line)
+    -- pcall: a line longer than runStream's buffer (about 64 KB) arrives in
+    -- pieces, and a piece is not valid JSON.
+    local okDecode, decoded = pcall(noctalia.json.decode, line)
+    if not okDecode then
+      decoded = nil
+    end
     if type(decoded) == "table" then
       if decoded.type == "snapshot" then
         local ok, err = pcall(onSnapshot, decoded)
@@ -207,7 +218,7 @@ local function onLine(gen, line)
       end
     end
   end
-  lastOutput = line
+  lastOutput = string.sub(line, 1, 500)
 end
 
 local function stopStream()
@@ -232,9 +243,10 @@ start = function()
     publish()
   end
   local script = string.format(
-    "exec 2>&1; %s watch --messages %d & echo %s $!; wait $!; echo %s $?",
+    "exec 2>&1; %s watch --messages %d --channels %d & echo %s $!; wait $!; echo %s $?",
     heron.shellQuote(streamCommand),
     MAX_MESSAGES,
+    MAX_CHANNELS,
     PID_MARK,
     EXIT_MARK
   )

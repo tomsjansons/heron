@@ -1,13 +1,20 @@
-//! Inbox unread list. Message metadata is not end-to-end encrypted, so no keys
-//! are needed. Changes are noticed through the core event loop; any relevant
-//! event triggers a re-fetch of the list.
+//! Inbox unread list and message content. Message metadata is not
+//! end-to-end encrypted, so listing needs no keys; changes are noticed through
+//! the core event loop and any relevant event triggers a re-fetch of the list.
+//!
+//! Fetching one message (`GET /mail/v4/messages/{id}`, as go-proton-api's
+//! `GetMessage`) returns its body as an armored PGP message encrypted to the
+//! keys of the receiving address (`AddressID`). The read state is untouched:
+//! Bridge fetches the same route for IMAP `BODY.PEEK[]` and marks messages
+//! read with a separate `PUT /mail/v4/messages/read`.
 
 use std::convert::Infallible;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use heron_core::hub::MailCommand;
-use heron_core::{Hub, MailUpdate, Message, Provider, SourceKind, SourceState};
+use heron_core::{Hub, MailUpdate, Message, MessageBody, Provider, SourceKind, SourceState, mailbody};
+use proton_crypto_account::proton_crypto::crypto::{DataEncoding, Decryptor, DecryptorSync, PGPProviderSync, VerifiedData};
 use serde::Deserialize;
 use serde::de::IgnoredAny;
 use serde_json::json;
@@ -15,13 +22,16 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::Backoff;
-use crate::api::{Api, flag, needs_auth, or_default};
+use crate::api::{Api, NeedsAuth, flag, needs_auth, or_default};
+use crate::keys::Keyring;
 
 /// Label id of the inbox.
 const INBOX: &str = "0";
 /// Largest page the messages route serves (go-proton-api `maxPageSize`).
 const MAX_PAGE: usize = 150;
 const EVENT_POLL: Duration = Duration::from_secs(25);
+/// A message to an address the keyring lacks re-unlocks the keys at most this often.
+const KEYRING_REFRESH: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -58,6 +68,101 @@ pub struct Count {
     pub label_id: String,
     #[serde(default, deserialize_with = "or_default")]
     pub unread: u32,
+}
+
+impl Sender {
+    fn display(&self) -> Option<String> {
+        mailbody::format_address(Some(&self.name), Some(&self.address))
+    }
+}
+
+/// One message with its encrypted body (go-proton-api `Message`).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct FullMessage {
+    #[serde(rename = "AddressID")]
+    pub address_id: String,
+    #[serde(default, deserialize_with = "or_default")]
+    pub subject: String,
+    pub sender: Option<Sender>,
+    #[serde(default, deserialize_with = "or_default")]
+    pub to_list: Vec<Sender>,
+    #[serde(rename = "CCList", default, deserialize_with = "or_default")]
+    pub cc_list: Vec<Sender>,
+    #[serde(default, deserialize_with = "or_default")]
+    pub time: i64,
+    /// Armored PGP message.
+    pub body: String,
+    /// "text/html", "text/plain", or "multipart/mixed" for PGP/MIME.
+    #[serde(rename = "MIMEType", default, deserialize_with = "or_default")]
+    pub mime_type: String,
+}
+
+impl FullMessage {
+    /// Decrypts and renders the body; headers come from the metadata.
+    pub fn into_body<P: PGPProviderSync>(self, provider: &P, keys: &[impl AsRef<P::PrivateKey>], id: &str) -> Result<MessageBody> {
+        // The signature is not verified; heron only previews.
+        let plain = provider.new_decryptor()
+            .with_decryption_key_refs(keys)
+            .decrypt(&self.body, DataEncoding::Armor)
+            .context("decrypting the message body")?;
+        let plain = plain.as_bytes();
+        let mime = self.mime_type.split(';').next().unwrap_or_default().trim().to_ascii_lowercase();
+        let rendered = match mime.as_str() {
+            "text/html" => mailbody::from_html(&String::from_utf8_lossy(plain)),
+            "multipart/mixed" => mailbody::from_mime(plain).context("parsing the PGP/MIME body")?,
+            _ => mailbody::from_text(&String::from_utf8_lossy(plain)),
+        };
+        let list = |list: &[Sender]| list.iter().filter_map(Sender::display).collect();
+        Ok(MessageBody {
+            id: id.to_owned(),
+            from: self.sender.as_ref().and_then(Sender::display).unwrap_or_default(),
+            to: list(&self.to_list),
+            cc: list(&self.cc_list),
+            date: self.time,
+            subject: self.subject,
+            text: rendered.text,
+            links: rendered.links,
+        })
+    }
+}
+
+/// Address keys, unlocked on the first fetch and kept for the connection.
+struct Keys<P: PGPProviderSync> {
+    keyring: Option<(Keyring<P>, Instant)>,
+}
+
+impl<P: PGPProviderSync> Keys<P> {
+    async fn for_address(&mut self, provider: &P, api: &Api, address_id: &str) -> Result<&[impl AsRef<P::PrivateKey> + use<P>]> {
+        let stale = match &self.keyring {
+            None => true,
+            Some((keyring, at)) => !keyring.addresses.contains_key(address_id) && at.elapsed() >= KEYRING_REFRESH,
+        };
+        if stale {
+            let passphrase = api.session().await.and_then(|s| s.key_passphrase)
+                .ok_or_else(|| NeedsAuth("the stored session has no key passphrase".into()))?;
+            self.keyring = Some((Keyring::unlock(provider, api, &passphrase).await?, Instant::now()));
+        }
+        let (keyring, _) = self.keyring.as_ref().expect("unlocked above");
+        keyring.addresses.get(address_id).map(Vec::as_slice)
+            .context("no key of the receiving address could be unlocked")
+    }
+}
+
+async fn fetch_body<P: PGPProviderSync>(provider: &P, api: &Api, keys: &mut Keys<P>, id: &str) -> Result<MessageBody> {
+    #[derive(Deserialize)]
+    struct Response {
+        #[serde(rename = "Message")]
+        message: FullMessage,
+    }
+    anyhow::ensure!(
+        !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'=')),
+        "not a Proton message id: {id:?}"
+    );
+    let message = api.get::<Response>(&format!("/mail/v4/messages/{id}"), &[]).await?.message;
+    debug!("proton: fetched message {id} ({}, {} bytes armored)", message.mime_type, message.body.len());
+    let keys = keys.for_address(provider, api, &message.address_id).await?;
+    message.into_body(provider, keys, id)
 }
 
 impl ApiMessage {
@@ -162,7 +267,7 @@ async fn apply(api: &Api, command: &MailCommand) -> Result<()> {
     let (route, id) = match command {
         MailCommand::MarkRead { id, .. } => ("/mail/v4/messages/read", id),
         MailCommand::MarkUnread { id, .. } => ("/mail/v4/messages/unread", id),
-        MailCommand::Fetch { .. } => anyhow::bail!("not supported yet"),
+        MailCommand::Fetch { .. } => anyhow::bail!("fetch is not a flag change"),
     };
     api.put::<IgnoredAny>(route, &json!({ "IDs": [id] })).await.map(drop)
 }
@@ -178,9 +283,10 @@ fn reply(command: MailCommand, result: Result<()>) {
 
 /// Runs until the session needs a new login, which is returned as the error.
 pub async fn run(api: &Api, account: &str, max: usize, hub: &Hub, commands: &mut mpsc::Receiver<MailCommand>) -> anyhow::Error {
+    let provider = proton_crypto_account::proton_crypto::new_pgp_provider();
     let mut backoff = Backoff::default();
     loop {
-        let Err(err) = connected(api, account, max, hub, commands, &mut backoff).await;
+        let Err(err) = connected(&provider, api, account, max, hub, commands, &mut backoff).await;
         if needs_auth(&err).is_some() {
             return err;
         }
@@ -199,7 +305,8 @@ pub async fn run(api: &Api, account: &str, max: usize, hub: &Hub, commands: &mut
     }
 }
 
-async fn connected(
+async fn connected<P: PGPProviderSync>(
+    provider: &P,
     api: &Api,
     account: &str,
     max: usize,
@@ -214,6 +321,7 @@ async fn connected(
     };
     publish(fetch(api, max).await?);
     backoff.reset();
+    let mut keys = Keys { keyring: None };
 
     let mut ticker = tokio::time::interval(EVENT_POLL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -227,6 +335,20 @@ async fn connected(
                 }
             }
             Some(command) = commands.recv() => {
+                if let MailCommand::Fetch { id, reply } = command {
+                    // Read state is untouched, so the list needs no refresh.
+                    match fetch_body(provider, api, &mut keys, &id).await {
+                        Ok(body) => drop(reply.send(Ok(body))),
+                        Err(err) => {
+                            warn!("proton/{account}: fetching message {id}: {err:#}");
+                            let _ = reply.send(Err(anyhow::anyhow!("{err:#}")));
+                            if needs_auth(&err).is_some() {
+                                return Err(err);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let result = apply(api, &command).await;
                 let failed = result.as_ref().err().map(|e| format!("{e:#}"));
                 reply(command, result);
@@ -286,6 +408,91 @@ mod tests {
         let update = mail_update(fixture.messages, &[], 1);
         assert_eq!(update.messages.len(), 1);
         assert_eq!(update.unread, 1);
+    }
+
+    mod body {
+        use proton_crypto_account::proton_crypto::crypto::{
+            Encryptor, EncryptorSync, KeyGenerator, KeyGeneratorSync, PGPProviderSync,
+        };
+        use proton_crypto_account::proton_crypto::new_pgp_provider;
+
+        use super::*;
+
+        /// Encrypts like a Proton client: to the recipient address key, signed by the sender.
+        fn encrypt<P: PGPProviderSync>(provider: &P, recipient: &P::PrivateKey, plain: &str) -> String {
+            let sender = provider.new_key_generator().with_user_id("Bob", "bob@example.com").generate().unwrap();
+            let public = provider.private_key_to_public_key(recipient).unwrap();
+            let armored = provider.new_encryptor()
+                .with_encryption_key(&public)
+                .with_signing_key(&sender)
+                .encrypt_raw(plain, DataEncoding::Armor)
+                .unwrap();
+            String::from_utf8(armored).unwrap()
+        }
+
+        fn message(mime: &str, armored: &str) -> FullMessage {
+            serde_json::from_value(json!({
+                "ID": "m1", "AddressID": "addr1", "Subject": "Quarterly report",
+                "Sender": {"Name": "Bob", "Address": "bob@example.com"},
+                "ToList": [{"Name": "", "Address": "me@proton.me"}, {"Name": "Anna", "Address": "anna@example.com"}],
+                "CCList": [{"Name": "Team", "Address": "team@example.com"}],
+                "BCCList": [], "Time": 1700000000, "Unread": 1, "Flags": 1,
+                "Header": "From: ignored@example.com\r\n", "ParsedHeaders": {},
+                "Body": armored, "MIMEType": mime, "Attachments": []
+            }))
+            .unwrap()
+        }
+
+        #[test]
+        fn decrypts_html_body() {
+            let provider = new_pgp_provider();
+            let key = provider.new_key_generator().with_user_id("Me", "me@proton.me").generate().unwrap();
+            let html = "<html><body><p>Hi,</p><p>The <a href=\"https://example.com/q3\">Q3 report</a> is ready.</p>\
+                        <img src=\"https://t.example/p.gif\" width=\"1\" height=\"1\"></body></html>";
+            let body = message("text/html", &encrypt(&provider, &key, html)).into_body(&provider, &[key], "m1").unwrap();
+            assert_eq!(body.id, "m1");
+            assert_eq!(body.from, "Bob <bob@example.com>");
+            assert_eq!(body.to, ["me@proton.me", "Anna <anna@example.com>"]);
+            assert_eq!(body.cc, ["Team <team@example.com>"]);
+            assert_eq!(body.subject, "Quarterly report");
+            assert_eq!(body.date, 1_700_000_000);
+            assert_eq!(body.text, "Hi,\n\nThe Q3 report is ready.");
+            assert_eq!(body.links, [heron_core::Link { text: "Q3 report".into(), url: "https://example.com/q3".into() }]);
+        }
+
+        #[test]
+        fn decrypts_plain_body() {
+            let provider = new_pgp_provider();
+            let key = provider.new_key_generator().with_user_id("Me", "me@proton.me").generate().unwrap();
+            let armored = encrypt(&provider, &key, "Rīga, café — see https://example.lv/x.\r\n\r\n\r\n\r\n-- \r\nBob");
+            let body = message("text/plain", &armored).into_body(&provider, &[key], "m1").unwrap();
+            assert_eq!(body.text, "Rīga, café — see https://example.lv/x.\n\n--\nBob");
+            assert_eq!(body.links.len(), 1);
+            assert_eq!(body.links[0].url, "https://example.lv/x");
+        }
+
+        #[test]
+        fn decrypts_pgp_mime_body() {
+            let provider = new_pgp_provider();
+            let key = provider.new_key_generator().with_user_id("Me", "me@proton.me").generate().unwrap();
+            let mime = "Content-Type: multipart/mixed; boundary=\"x\"\r\n\r\n--x\r\n\
+                Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n\
+                Sveiki, R=C4=ABga! Details: https://example.lv/d\r\n--x\r\n\
+                Content-Type: application/octet-stream; name=a.bin\r\nContent-Disposition: attachment\r\n\r\nAAAA\r\n--x--\r\n";
+            let body = message("multipart/mixed", &encrypt(&provider, &key, mime)).into_body(&provider, &[key], "m1").unwrap();
+            assert_eq!(body.text, "Sveiki, Rīga! Details: https://example.lv/d");
+            assert_eq!(body.from, "Bob <bob@example.com>", "headers come from the metadata");
+            assert_eq!(body.links.len(), 1);
+        }
+
+        #[test]
+        fn wrong_key_fails() {
+            let provider = new_pgp_provider();
+            let key = provider.new_key_generator().with_user_id("Me", "me@proton.me").generate().unwrap();
+            let other = provider.new_key_generator().with_user_id("Other", "o@proton.me").generate().unwrap();
+            let err = message("text/html", &encrypt(&provider, &key, "<p>x</p>")).into_body(&provider, &[other], "m1").unwrap_err();
+            assert!(format!("{err:#}").contains("decrypting the message body"));
+        }
     }
 
     #[test]

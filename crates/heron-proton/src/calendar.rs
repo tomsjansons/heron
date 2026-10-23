@@ -11,7 +11,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use heron_core::{CalendarEvent, Hub, SourceKind, SourceState};
+use heron_core::meeting::{find_meeting_url, html_to_text, meeting_url, truncate};
+use heron_core::{CalendarEvent, EventDetails, Hub, SourceKind, SourceState};
 use proton_crypto_account::keys::UnlockedAddressKey;
 use proton_crypto_account::proton_crypto::crypto::{DataEncoding, Decryptor, DecryptorSync, PGPProviderSync};
 use serde::Deserialize;
@@ -27,6 +28,10 @@ const UNUSABLE: u32 = 4 | 8 | 16;
 /// Event part types: bit 1 encrypted, bit 2 signed.
 const PART_ENCRYPTED: u8 = 1;
 const PAGE_SIZE: usize = 100;
+/// Description characters kept in [`EventDetails`].
+const DESCRIPTION_MAX: usize = 2000;
+/// Attendees kept in [`EventDetails`].
+const ATTENDEES_MAX: usize = 30;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -111,6 +116,40 @@ struct ApiEvent {
     shared_events: Vec<Part>,
     #[serde(default, deserialize_with = "or_default")]
     calendar_events: Vec<Part>,
+    /// ATTENDEE properties, encrypted with the shared session key.
+    #[serde(default, deserialize_with = "or_default")]
+    attendees_events: Vec<Part>,
+    /// Each attendee's answer in the clear, keyed by the `X-PM-TOKEN` of
+    /// their ATTENDEE property.
+    #[serde(default, deserialize_with = "or_default")]
+    attendees_info: AttendeesInfo,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct AttendeesInfo {
+    #[serde(default, deserialize_with = "or_default")]
+    attendees: Vec<AttendeeInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct AttendeeInfo {
+    #[serde(default, deserialize_with = "or_default")]
+    token: String,
+    /// WebClients `ATTENDEE_STATUS_API`.
+    #[serde(default, deserialize_with = "or_default")]
+    status: u8,
+}
+
+/// iCalendar PARTSTAT for an `ATTENDEE_STATUS_API` value.
+fn partstat(status: u8) -> &'static str {
+    match status {
+        1 => "TENTATIVE",
+        2 => "DECLINED",
+        3 => "ACCEPTED",
+        _ => "NEEDS-ACTION",
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -230,7 +269,7 @@ async fn sync<P: PGPProviderSync>(
             // Keys may have rotated; bootstrap again next time.
             cache.remove(&calendar.id);
         }
-        out.extend(to_occurrences(&decrypted, account, &member, from, to));
+        out.extend(to_occurrences(&decrypted, account, &member, &keyring.emails, from, to));
     }
     Ok(out)
 }
@@ -353,8 +392,16 @@ fn decrypt_event<P: PGPProviderSync>(
             Err(err) => debug!("event {}: calendar part: {err:#}", event.id),
         }
     }
+    for part in &event.attendees_events {
+        // Only for details and declined invitations; not fatal either.
+        match read_part(provider, part, shared_key.as_ref()) {
+            Ok(text) => parts.push(text),
+            Err(err) => debug!("event {}: attendees part: {err:#}", event.id),
+        }
+    }
 
     let mut vevent = VEvent::from_parts(parts.iter().map(String::as_str));
+    apply_answers(&mut vevent, &event.attendees_info);
     if vevent.start.is_none() {
         // Fall back to the clear metadata.
         let time = |ts: i64| chrono::DateTime::from_timestamp(ts, 0).map(|dt| dt.naive_utc());
@@ -362,6 +409,56 @@ fn decrypt_event<P: PGPProviderSync>(
         vevent.end = time(event.end_time).map(|t| if event.full_day { Time::Date(t.date()) } else { Time::Utc(t) });
     }
     Ok(vevent)
+}
+
+/// Answers live in the clear `AttendeesInfo`, not in the encrypted
+/// ATTENDEE properties (WebClients `toInternalAttendee`).
+fn apply_answers(vevent: &mut VEvent, info: &AttendeesInfo) {
+    for attendee in &mut vevent.attendees {
+        let answer = attendee.token.as_ref().and_then(|token| info.attendees.iter().find(|a| a.token == *token));
+        if let Some(answer) = answer {
+            attendee.partstat = Some(partstat(answer.status).to_owned());
+        }
+    }
+}
+
+/// True when the user was invited and declined with every address invited.
+fn declined(vevent: &VEvent, me: &[String]) -> bool {
+    let mut mine = vevent.attendees.iter().filter(|a| a.email.as_ref().is_some_and(|e| me.contains(e))).peekable();
+    mine.peek().is_some() && mine.all(|a| a.partstat.as_deref() == Some("DECLINED"))
+}
+
+/// The link of a conference property (Proton's, Google's, Microsoft's or
+/// RFC 7986 `CONFERENCE`, taken as is when https; `URL` only when it is a
+/// known video service), else a link in the location or description.
+fn event_meeting_url(vevent: &VEvent) -> Option<String> {
+    vevent.conference_urls()
+        .find_map(|(property, url)| match meeting_url(url) {
+            Some(url) => Some(url),
+            None if property != "URL" && url.starts_with("https://") => Some(url.to_owned()),
+            None => None,
+        })
+        .or_else(|| {
+            let texts = [vevent.location.as_deref(), vevent.description.as_deref()];
+            find_meeting_url(&texts.into_iter().flatten().collect::<Vec<_>>())
+        })
+}
+
+/// Description, organizer unless it is the user, and the other people
+/// invited (not the user, the organizer or rooms).
+fn details(vevent: &VEvent, me: &[String]) -> EventDetails {
+    let is_me = |email: &Option<String>| email.as_ref().is_some_and(|e| me.contains(e));
+    let description = vevent.description.as_deref().map(html_to_text).filter(|d| !d.is_empty())
+        .map(|d| truncate(&d, DESCRIPTION_MAX));
+    let organizer = vevent.organizer.as_ref().filter(|o| !is_me(&o.email));
+    let organizer_email = vevent.organizer.as_ref().and_then(|o| o.email.clone());
+    let attendees = vevent.attendees.iter()
+        .filter(|a| !is_me(&a.email) && !a.is_resource())
+        .filter(|a| organizer_email.is_none() || a.email != organizer_email)
+        .filter_map(|a| a.label())
+        .take(ATTENDEES_MAX)
+        .collect();
+    EventDetails { description, organizer: organizer.and_then(|o| o.label()), attendees }
 }
 
 fn read_part<P: PGPProviderSync>(provider: &P, part: &Part, key: Option<&P::SessionKey>) -> Result<String> {
@@ -379,8 +476,16 @@ fn read_part<P: PGPProviderSync>(provider: &P, part: &Part, key: Option<&P::Sess
 }
 
 /// Expands decrypted events into agenda entries. Occurrences replaced by a
-/// RECURRENCE-ID event are dropped from the series; cancelled ones vanish.
-fn to_occurrences(events: &[(ApiEvent, VEvent)], account: &str, member: &Member, from: i64, to: i64) -> Vec<CalendarEvent> {
+/// RECURRENCE-ID event are dropped from the series; cancelled ones and
+/// invitations the user (one of `me`, lowercase addresses) declined vanish.
+fn to_occurrences(
+    events: &[(ApiEvent, VEvent)],
+    account: &str,
+    member: &Member,
+    me: &[String],
+    from: i64,
+    to: i64,
+) -> Vec<CalendarEvent> {
     let uid = |(api, vevent): &(ApiEvent, VEvent)| vevent.uid.clone().unwrap_or_else(|| api.uid.clone());
     let recurrence = |(api, vevent): &(ApiEvent, VEvent)| vevent.recurrence_id.and_then(Time::timestamp).or(api.recurrence_id);
 
@@ -393,7 +498,7 @@ fn to_occurrences(events: &[(ApiEvent, VEvent)], account: &str, member: &Member,
 
     let mut out = Vec::new();
     for event @ (api, vevent) in events {
-        if vevent.cancelled() {
+        if vevent.cancelled() || declined(vevent, me) {
             continue;
         }
         let exception = recurrence(event).is_some();
@@ -415,6 +520,8 @@ fn to_occurrences(events: &[(ApiEvent, VEvent)], account: &str, member: &Member,
             }
         };
         let recurring = vevent.rrule.is_some() || exception;
+        let meeting_url = event_meeting_url(vevent);
+        let details = details(vevent, me);
         for occurrence in occurrences {
             let recurrence_id = recurring.then(|| recurrence(event).unwrap_or(occurrence.start));
             out.push(CalendarEvent {
@@ -428,8 +535,8 @@ fn to_occurrences(events: &[(ApiEvent, VEvent)], account: &str, member: &Member,
                 all_day: vevent.all_day(),
                 color: member.color.clone(),
                 url: Some(event_url(&api.calendar_id, &api.id, recurrence_id)),
-            meeting_url: None,
-            details: None,
+                meeting_url: meeting_url.clone(),
+                details: Some(details.clone()),
             });
         }
     }
@@ -521,7 +628,7 @@ mod tests {
             "BEGIN:VEVENT\r\nUID:u1\r\nRECURRENCE-ID:20261022T090000Z\r\nDTSTART:20261022T090000Z\r\nSTATUS:CANCELLED\r\nEND:VEVENT",
         ]);
         let events = [series, moved, cancelled];
-        let list = to_occurrences(&events, "proton", &member(), ts("2026-10-20T00:00:00Z"), ts("2026-10-30T00:00:00Z"));
+        let list = to_occurrences(&events, "proton", &member(), &[], ts("2026-10-20T00:00:00Z"), ts("2026-10-30T00:00:00Z"));
 
         let got: Vec<(&str, i64)> = list.iter().map(|e| (e.title.as_str(), e.start)).collect();
         assert_eq!(got, [
@@ -580,7 +687,7 @@ mod tests {
             public_key: address_public.clone(),
         };
         let calendar_keys = unlock_calendar(&provider, &bootstrap, &member(), std::slice::from_ref(&address)).unwrap();
-        let keyring = Keyring { addresses: HashMap::from([("addr".to_owned(), vec![address])]) };
+        let keyring = Keyring { addresses: HashMap::from([("addr".to_owned(), vec![address])]), emails: vec!["me@proton.me".into()] };
 
         let signed = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:u\r\nDTSTART:20261025T120000Z\r\nDTEND:20261025T130000Z\r\nEND:VEVENT\r\nEND:VCALENDAR";
         let secret = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:u\r\nSUMMARY:Dentist\r\nLOCATION:Main St 1\r\nEND:VEVENT\r\nEND:VCALENDAR";
@@ -612,11 +719,56 @@ mod tests {
     }
 
     #[test]
+    fn details_meeting_links_and_declined_invitations() {
+        const SHARED: &str = "BEGIN:VEVENT\r\nUID:{uid}\r\nDTSTART:20261025T120000Z\r\nDTEND:20261025T130000Z\r\n\
+            SUMMARY:{uid}\r\nORGANIZER;CN=Boss:mailto:boss@x.com\r\n{extra}END:VEVENT";
+        const ATTENDEES: &str = "BEGIN:VEVENT\r\nUID:{uid}\r\n\
+            ATTENDEE;CN=Boss;X-PM-TOKEN=t0:mailto:boss@x.com\r\n\
+            ATTENDEE;CN=me@proton.me;PARTSTAT=NEEDS-ACTION;X-PM-TOKEN=t1:mailto:Me@Proton.me\r\n\
+            ATTENDEE;CN=Ann;X-PM-TOKEN=t2:mailto:ann@x.com\r\n\
+            ATTENDEE;CUTYPE=ROOM;CN=Room:mailto:room@x.com\r\nEND:VEVENT";
+        let make = |uid: &str, extra: &str, my_status: u8| {
+            let mut api: ApiEvent = serde_json::from_str(&format!(r#"{{"ID":"{uid}","CalendarID":"cal","UID":"{uid}",
+                "AttendeesInfo":{{"Attendees":[{{"Token":"t1","Status":{my_status}}},{{"Token":"t2","Status":3}}],"MoreAttendees":0}}}}"#)).unwrap();
+            let shared = SHARED.replace("{uid}", uid).replace("{extra}", extra);
+            let mut vevent = VEvent::from_parts([shared.as_str(), ATTENDEES.replace("{uid}", uid).as_str()]);
+            apply_answers(&mut vevent, &std::mem::take(&mut api.attendees_info));
+            (api, vevent)
+        };
+        let events = [
+            make("teams", "LOCATION:Teams https://teams.microsoft.com/l/meetup-join/abc\r\n", 0),
+            make("zoom", "DESCRIPTION:Notes\\nJoin: <https://acme.zoom.us/j/1?pwd=x>.\r\n", 3),
+            make("proton", "X-PM-CONFERENCE-URL:https://meet.proton.me/join/id-a#pwd-b\r\nDESCRIPTION:https://zoom.us/j/2\r\n", 1),
+            make("declined", "", 2),
+            make("info", "URL:https://example.com/agenda\r\n", 3),
+        ];
+        let me = ["me@proton.me".to_owned()];
+        let list = to_occurrences(&events, "p", &member(), &me, ts("2026-10-22T00:00:00Z"), ts("2026-10-29T00:00:00Z"));
+
+        let got: Vec<(&str, Option<&str>)> = list.iter().map(|e| (e.title.as_str(), e.meeting_url.as_deref())).collect();
+        assert_eq!(got, [
+            ("teams", Some("https://teams.microsoft.com/l/meetup-join/abc")),
+            ("zoom", Some("https://acme.zoom.us/j/1?pwd=x")),
+            ("proton", Some("https://meet.proton.me/join/id-a#pwd-b")),
+            ("info", None),
+        ]);
+        let zoom = list[1].details.as_ref().unwrap();
+        assert_eq!(zoom.description.as_deref(), Some("Notes\nJoin: <https://acme.zoom.us/j/1?pwd=x>."));
+        assert_eq!(zoom.organizer.as_deref(), Some("Boss"));
+        assert_eq!(zoom.attendees, ["Ann"]);
+
+        // Without knowing the user's addresses nothing is declined, and the user is listed.
+        let all = to_occurrences(&events, "p", &member(), &[], ts("2026-10-22T00:00:00Z"), ts("2026-10-29T00:00:00Z"));
+        assert_eq!(all.len(), 5);
+        assert_eq!(all[0].details.as_ref().unwrap().attendees, ["me@proton.me", "Ann"]);
+    }
+
+    #[test]
     fn untitled_single_event() {
         let single = event(r#"{"ID":"ev","CalendarID":"cal","UID":"u"}"#, &[
             "BEGIN:VEVENT\r\nUID:u\r\nDTSTART:20261025T120000Z\r\nDTEND:20261025T123000Z\r\nLOCATION:Cafe\r\nEND:VEVENT",
         ]);
-        let list = to_occurrences(&[single], "p", &member(), ts("2026-10-22T00:00:00Z"), ts("2026-10-29T00:00:00Z"));
+        let list = to_occurrences(&[single], "p", &member(), &[], ts("2026-10-22T00:00:00Z"), ts("2026-10-29T00:00:00Z"));
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].title, "(no title)");
         assert_eq!(list[0].location.as_deref(), Some("Cafe"));

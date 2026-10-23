@@ -10,10 +10,13 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 
-use heron_core::{DiscordChannel, DiscordGuild};
-use jiff::Timestamp;
+use heron_core::{DISCORD_UNREAD_CAP, DiscordChannel, DiscordGuild, DiscordMessage};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::Value;
+use tracing::debug;
 
+use crate::history::{self, Fetched};
+use crate::messages::{self, Buffer, Names};
 use crate::permissions::{Member, Overwrite, OverwriteKind};
 
 const DISCORD_EPOCH_MS: i64 = 1_420_070_400_000;
@@ -36,6 +39,11 @@ const GUILD_OPT_IN_CHANNELS_ON: u64 = 1 << 14;
 
 const NOTIFY_ALL_MESSAGES: u64 = 0;
 const NOTIFY_PARENT_DEFAULT: u64 = 3;
+
+/// A failed history fetch is retried after this long.
+const FETCH_RETRY: SignedDuration = SignedDuration::from_mins(5);
+/// Nicknames remembered from message events, for REST history authors.
+const MAX_NICKS: usize = 5000;
 
 #[derive(Debug, Clone, PartialEq)]
 struct Channel {
@@ -145,6 +153,26 @@ pub struct GuildState {
     settings: Settings,
     blocked: HashSet<u64>,
     user_flags: u64,
+    role_names: HashMap<u64, String>,
+    /// Guild nicknames seen in message events; REST history has no members.
+    nicks: HashMap<u64, String>,
+    /// Unread messages per channel.
+    buffers: HashMap<u64, Buffer>,
+    /// History requested and not yet loaded.
+    pending: HashSet<u64>,
+    /// When a history fetch last failed.
+    failed: HashMap<u64, Timestamp>,
+}
+
+/// A channel in the published list.
+struct Listed<'a> {
+    channel: &'a Channel,
+    mentions: u32,
+    /// Has messages newer than the read state.
+    unread: bool,
+    /// Counts as unread (not muted, not "only mentions", opted in).
+    shown: bool,
+    key: (Reverse<u32>, i64, i64, u64),
 }
 
 impl GuildState {
@@ -184,13 +212,23 @@ impl GuildState {
                 true
             }
             "GUILD_ROLE_CREATE" | "GUILD_ROLE_UPDATE" if self.is_ours(d.get("guild_id")) => {
-                d.get("role").and_then(parse_role).map(|(id, perms)| self.roles.insert(id, perms)).is_some()
+                let Some(role) = d.get("role") else { return false };
+                if let (Some(id), Some(name)) = (snowflake(role.get("id")), role.get("name").and_then(Value::as_str)) {
+                    self.role_names.insert(id, name.to_owned());
+                }
+                parse_role(role).map(|(id, perms)| self.roles.insert(id, perms)).is_some()
             }
             "GUILD_ROLE_DELETE" if self.is_ours(d.get("guild_id")) => {
-                snowflake(d.get("role_id")).and_then(|id| self.roles.remove(&id)).is_some()
+                let Some(id) = snowflake(d.get("role_id")) else { return false };
+                self.role_names.remove(&id);
+                self.roles.remove(&id).is_some()
             }
             "GUILD_MEMBER_UPDATE" if self.is_ours(d.get("guild_id")) => {
-                if snowflake(d.pointer("/user/id")).is_none_or(|id| Some(id) != self.user_id) {
+                let user = snowflake(d.pointer("/user/id"));
+                if user.is_none_or(|id| Some(id) != self.user_id) {
+                    if let Some(user) = user.filter(|id| self.nicks.contains_key(id)) {
+                        self.remember_nick(user, d);
+                    }
                     return false;
                 }
                 self.member_roles = snowflakes(d.get("roles"));
@@ -207,6 +245,7 @@ impl GuildState {
             "CHANNEL_DELETE" if self.is_ours(d.get("guild_id")) => {
                 let Some(id) = snowflake(d.get("id")) else { return false };
                 self.read_states.remove(&id);
+                self.buffers.remove(&id);
                 self.channels.remove(&id).is_some()
             }
             "CHANNEL_UNREAD_UPDATE" if self.is_ours(d.get("guild_id")) => {
@@ -223,6 +262,19 @@ impl GuildState {
                 changed
             }
             "MESSAGE_CREATE" => self.message_create(d),
+            "MESSAGE_UPDATE" => self.message_update(d),
+            "MESSAGE_DELETE" if self.is_ours(d.get("guild_id")) => {
+                let (Some(channel), Some(id)) = (snowflake(d.get("channel_id")), snowflake(d.get("id"))) else {
+                    return false;
+                };
+                self.buffers.get_mut(&channel).is_some_and(|b| b.remove(id))
+            }
+            "MESSAGE_DELETE_BULK" if self.is_ours(d.get("guild_id")) => {
+                let Some(buffer) = snowflake(d.get("channel_id")).and_then(|c| self.buffers.get_mut(&c)) else {
+                    return false;
+                };
+                snowflakes(d.get("ids")).into_iter().fold(false, |changed, id| buffer.remove(id) | changed)
+            }
             "MESSAGE_ACK" => self.message_ack(d),
             "USER_GUILD_SETTINGS_UPDATE" if self.is_ours(d.get("guild_id")) => {
                 self.settings = Settings::parse(d);
@@ -320,7 +372,11 @@ impl GuildState {
         if let Some(joined) = g.get("joined_at").and_then(Value::as_str).and_then(timestamp_snowflake) {
             self.joined = Some(joined);
         }
-        self.roles = g.get("roles").and_then(Value::as_array).into_iter().flatten().filter_map(parse_role).collect();
+        let roles = g.get("roles").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+        self.roles = roles.iter().filter_map(parse_role).collect();
+        self.role_names = roles.iter()
+            .filter_map(|r| Some((snowflake(r.get("id"))?, r.get("name")?.as_str()?.to_owned())))
+            .collect();
         let old = std::mem::take(&mut self.channels);
         self.channels = g.get("channels").and_then(Value::as_array).into_iter().flatten()
             .filter_map(parse_channel)
@@ -356,30 +412,194 @@ impl GuildState {
         let (Some(channel_id), Some(message_id)) = (snowflake(d.get("channel_id")), snowflake(d.get("id"))) else {
             return false;
         };
-        let Some(channel) = self.channels.get_mut(&channel_id) else { return false };
-        channel.last_message_id = channel.last_message_id.max(Some(message_id));
+        if !self.channels.contains_key(&channel_id) {
+            return false;
+        }
+        // Whether every unread message so far is buffered, before this one
+        // moves `last_message_id`.
+        let complete = self.complete(channel_id);
+        if let Some(channel) = self.channels.get_mut(&channel_id) {
+            channel.last_message_id = channel.last_message_id.max(Some(message_id));
+        }
 
         let author = snowflake(d.pointer("/author/id"));
+        if let (Some(author), Some(member)) = (author, d.get("member")) {
+            self.remember_nick(author, member);
+        }
+        for mention in d.get("mentions").and_then(Value::as_array).into_iter().flatten() {
+            if let (Some(user), Some(member)) = (snowflake(mention.get("id")), mention.get("member")) {
+                self.remember_nick(user, member);
+            }
+        }
+
         if author.is_some() && author == self.user_id {
             // Sending a message acknowledges the channel.
             if d.get("type").and_then(Value::as_u64) != Some(MESSAGE_POLL_RESULT) {
                 let state = self.read_states.entry(channel_id).or_default();
                 state.last_acked = state.last_acked.max(Some(message_id));
                 state.mentions = 0;
+                if let Some(buffer) = self.buffers.get_mut(&channel_id) {
+                    buffer.ack(message_id);
+                }
             }
             return true;
         }
         if author.is_some_and(|a| self.blocked.contains(&a)) {
+            if complete {
+                self.buffers.entry(channel_id).or_default().through = Some(message_id);
+            }
             return true;
         }
-        let acked = self.read_states.get(&channel_id).and_then(|s| s.last_acked).or(self.joined);
-        if acked.is_some_and(|acked| acked >= message_id) {
+        if self.acked(channel_id).is_some_and(|acked| acked >= message_id) {
             return true;
         }
-        if self.mentions_me(d) || self.low_importance_mention(channel_id, Timestamp::now()) {
+        let mentions_me = self.mentions_me(d);
+        if mentions_me || self.low_importance_mention(channel_id, Timestamp::now()) {
             let state = self.read_states.entry(channel_id).or_default();
             state.mentions = state.mentions.saturating_add(1);
         }
+        let preview = self.preview(d, mentions_me);
+        let buffer = self.buffers.entry(channel_id).or_default();
+        buffer.insert(message_id, preview);
+        if complete {
+            buffer.through = buffer.through.max(Some(message_id));
+        }
+        true
+    }
+
+    /// Edits re-render a previewed message; other edits change nothing shown.
+    fn message_update(&mut self, d: &Value) -> bool {
+        if !self.is_ours(d.get("guild_id")) || d.get("content").is_none() {
+            return false;
+        }
+        let (Some(channel_id), Some(message_id)) = (snowflake(d.get("channel_id")), snowflake(d.get("id"))) else {
+            return false;
+        };
+        if !self.buffers.get(&channel_id).is_some_and(|b| b.contains(message_id)) {
+            return false;
+        }
+        let mentions_me = d.get("mentions").map(|_| self.mentions_me(d));
+        let content = messages::content(d, &self.names());
+        let Some(buffer) = self.buffers.get_mut(&channel_id) else { return false };
+        buffer.update(message_id, |m| {
+            m.content = content;
+            if let Some(mentions_me) = mentions_me {
+                m.mentions_me = mentions_me;
+            }
+        })
+    }
+
+    fn names(&self) -> Names<'_> {
+        Names { nicks: &self.nicks, roles: &self.role_names, channels: self }
+    }
+
+    fn preview(&self, d: &Value, mentions_me: bool) -> Option<DiscordMessage> {
+        messages::preview(d, mentions_me, &self.names())
+    }
+
+    /// Takes the nick from a member object; `"nick": null` forgets it.
+    fn remember_nick(&mut self, user: u64, member: &Value) {
+        match member.get("nick") {
+            Some(Value::String(nick)) if !nick.is_empty() => {
+                if self.nicks.len() >= MAX_NICKS && !self.nicks.contains_key(&user) {
+                    self.nicks.clear();
+                }
+                self.nicks.insert(user, nick.clone());
+            }
+            Some(_) => {
+                self.nicks.remove(&user);
+            }
+            None => {}
+        }
+    }
+
+    /// The channel's read-up-to message, falling back to the join time.
+    fn acked(&self, channel_id: u64) -> Option<u64> {
+        self.read_states.get(&channel_id).and_then(|s| s.last_acked).or(self.joined)
+    }
+
+    /// Every unread message of the channel is in its buffer (or it is read).
+    fn complete(&self, channel_id: u64) -> bool {
+        let Some(channel) = self.channels.get(&channel_id) else { return true };
+        let known = self.buffers.get(&channel_id).and_then(|b| b.through).max(self.acked(channel_id));
+        channel.last_message_id <= known
+    }
+
+    /// Listed unread channels whose unread messages are not all known, in
+    /// display order; they are marked pending until [`Self::load_history`].
+    pub fn take_fetches(&mut self, now: Timestamp) -> Vec<u64> {
+        let unread: Vec<u64> = self.listed(now).iter().filter(|l| l.unread).map(|l| l.channel.id).collect();
+        let wanted: Vec<u64> = unread.into_iter()
+            .filter(|id| {
+                !self.pending.contains(id)
+                    && !self.complete(*id)
+                    && self.failed.get(id).is_none_or(|at| now.duration_since(*at) >= FETCH_RETRY)
+            })
+            .collect();
+        self.pending.extend(&wanted);
+        wanted
+    }
+
+    /// Merges a channel's fetched history; returns whether anything changed.
+    pub fn load_history(&mut self, channel_id: u64, result: Fetched, now: Timestamp) -> bool {
+        self.pending.remove(&channel_id);
+        let Some(latest) = self.channels.get(&channel_id).map(|c| c.last_message_id) else { return false };
+        let list = match result {
+            Fetched::Messages(list) => list,
+            Fetched::Unavailable => {
+                let buffer = self.buffers.entry(channel_id).or_default();
+                buffer.through = buffer.through.max(latest);
+                return true;
+            }
+            Fetched::Failed => {
+                self.failed.insert(channel_id, now);
+                return false;
+            }
+        };
+        self.failed.remove(&channel_id);
+        debug!("discord: loaded {} messages of channel {channel_id}", list.len());
+
+        let acked = self.acked(channel_id).unwrap_or(0);
+        let mut messages: Vec<(u64, &Value)> = list.iter().filter_map(|m| Some((snowflake(m.get("id"))?, m))).collect();
+        messages.sort_by_key(|(id, _)| Reverse(*id));
+        // A message of our own reads everything before it.
+        let floor = messages.iter()
+            .filter(|(_, m)| self.user_id.is_some() && snowflake(m.pointer("/author/id")) == self.user_id)
+            .map(|(id, _)| *id)
+            .fold(acked, u64::max);
+        let newest = messages.first().map(|(id, _)| *id);
+        if let Some(channel) = self.channels.get_mut(&channel_id) {
+            channel.last_message_id = channel.last_message_id.max(newest);
+        }
+        // A full page that is unread throughout: older unread ones exist.
+        let more = messages.len() >= history::PAGE && messages.last().is_some_and(|(oldest, _)| *oldest > floor);
+
+        let buffered = |id: u64| self.buffers.get(&channel_id).is_some_and(|b| b.contains(id));
+        let mut previews = heron_core::DISCORD_PREVIEW_MESSAGES;
+        let entries: Vec<(u64, Option<DiscordMessage>)> = messages.iter()
+            .filter(|(id, m)| *id > floor && !snowflake(m.pointer("/author/id")).is_some_and(|a| self.blocked.contains(&a)))
+            .map(|(id, m)| {
+                // Keep previews built from gateway events: they carry nicks.
+                let preview = (previews > 0).then(|| {
+                    previews -= 1;
+                    if buffered(*id) { None } else { self.preview(m, self.mentions_me(m)) }
+                });
+                (*id, preview.flatten())
+            })
+            .collect();
+
+        let buffer = self.buffers.entry(channel_id).or_default();
+        for (id, preview) in entries {
+            buffer.insert(id, preview);
+        }
+        if more {
+            buffer.mark_more();
+        }
+        if floor > acked {
+            buffer.ack(floor);
+        }
+        // Later messages arrive as events and are appended.
+        buffer.through = buffer.through.max(latest.max(newest));
         true
     }
 
@@ -415,11 +635,19 @@ impl GuildState {
         }
         let manual = d.get("manual").and_then(Value::as_bool) == Some(true);
         let state = self.read_states.entry(channel_id).or_default();
-        if !manual && state.last_acked.is_some_and(|acked| acked > message_id) {
+        let previous = state.last_acked;
+        if !manual && previous.is_some_and(|acked| acked > message_id) {
             return false;
         }
         state.last_acked = Some(message_id);
         state.mentions = count(d.get("mention_count"));
+        if previous.is_some_and(|previous| previous > message_id) {
+            // Marked unread: messages before the old read state were never
+            // buffered, so fetch again.
+            self.buffers.remove(&channel_id);
+        } else if let Some(buffer) = self.buffers.get_mut(&channel_id) {
+            buffer.ack(message_id);
+        }
         true
     }
 
@@ -467,13 +695,10 @@ impl GuildState {
             .unwrap_or(1)
     }
 
-    /// The published view: viewable text channels that are unread (and not
-    /// muted) or have mentions, most mentions first, then in sidebar order.
-    pub fn snapshot(&self, now: Timestamp) -> Option<DiscordGuild> {
-        let user_id = self.user_id?;
-        if !self.present {
-            return None;
-        }
+    /// Viewable text channels that are unread (and not muted) or have
+    /// mentions, most mentions first, then in sidebar order.
+    fn listed(&self, now: Timestamp) -> Vec<Listed<'_>> {
+        let (Some(user_id), true) = (self.user_id, self.present) else { return Vec::new() };
         let member = Member {
             guild_id: self.guild_id,
             user_id,
@@ -481,47 +706,70 @@ impl GuildState {
             roles: &self.roles,
             member_roles: &self.member_roles,
         };
-
-        let mut listed: Vec<(_, DiscordChannel)> = Vec::new();
+        let mut listed = Vec::new();
         for channel in self.channels.values().filter(|c| c.is_text()) {
             if !member.can_view(&channel.overwrites) {
                 continue;
             }
-            let state = self.read_states.get(&channel.id);
-            let mentions = state.map_or(0, |s| s.mentions);
-            let acked = state.and_then(|s| s.last_acked).or(self.joined);
-            let unread = match (channel.last_message_id, acked) {
-                (Some(latest), Some(acked)) => latest > acked,
-                (Some(_), None) => true,
-                (None, _) => false,
-            };
+            let mentions = self.read_states.get(&channel.id).map_or(0, |s| s.mentions);
+            let unread = channel.last_message_id > self.acked(channel.id);
             let shown = unread && !self.muted(channel, now) && !self.unreads_only_mentions(channel) && self.opted_in(channel);
             if !shown && mentions == 0 {
                 continue;
             }
             let category = channel.parent.and_then(|p| self.channels.get(&p)).map_or(-1, |c| c.position);
             let key = (Reverse(mentions), category, channel.position, channel.id);
-            listed.push((key, DiscordChannel {
-                id: channel.id.to_string(),
-                name: channel.name.clone(),
-                mentions,
-                url: format!("https://discord.com/channels/{}/{}", self.guild_id, channel.id),
-                unread: 0,
-                more: false,
-                messages: Vec::new(),
-            }));
+            listed.push(Listed { channel, mentions, unread, shown, key });
         }
-        listed.sort_by_key(|(key, _)| *key);
-        let channels: Vec<DiscordChannel> = listed.into_iter().map(|(_, c)| c).collect();
+        listed.sort_by_key(|l| l.key);
+        listed
+    }
+
+    /// The published view of [`Self::listed`] channels with unread counts
+    /// and previews. The guild's message total counts unmuted channels only.
+    pub fn snapshot(&self, now: Timestamp) -> Option<DiscordGuild> {
+        self.user_id?;
+        if !self.present {
+            return None;
+        }
+        let mut unread_messages = 0u32;
+        let channels: Vec<DiscordChannel> = self.listed(now).into_iter().map(|l| {
+            let id = l.channel.id;
+            let buffer = self.buffers.get(&id).filter(|_| l.unread);
+            let (mut unread, more) = buffer.map_or((0, false), Buffer::count);
+            if l.unread && unread == 0 && !self.complete(id) {
+                // History not loaded yet; it is at least one.
+                unread = 1;
+            }
+            let unread = unread.min(DISCORD_UNREAD_CAP);
+            if l.shown {
+                unread_messages = unread_messages.saturating_add(unread);
+            }
+            DiscordChannel {
+                id: id.to_string(),
+                name: l.channel.name.clone(),
+                unread,
+                more,
+                mentions: l.mentions,
+                url: format!("https://discord.com/channels/{}/{id}", self.guild_id),
+                messages: buffer.map(Buffer::previews).unwrap_or_default(),
+            }
+        }).collect();
 
         Some(DiscordGuild {
             id: self.guild_id.to_string(),
             name: self.name.clone(),
             unread_channels: channels.len() as u32,
-            unread_messages: 0,
+            unread_messages,
             mentions: channels.iter().map(|c| c.mentions).fold(0, u32::saturating_add),
             channels,
         })
+    }
+}
+
+impl messages::ChannelNames for GuildState {
+    fn channel_name(&self, id: u64) -> Option<String> {
+        self.channels.get(&id).map(|c| c.name.clone())
     }
 }
 
@@ -805,5 +1053,233 @@ mod tests {
         let guild: Value = serde_json::from_str::<Value>(READY).unwrap()["guilds"][1].clone();
         assert!(state.apply("GUILD_CREATE", &guild));
         assert_eq!(state.snapshot(now()).unwrap().unread_channels, 5);
+    }
+
+    const HISTORY_GENERAL: &str = include_str!("fixtures/history_general.json");
+
+    fn channel(state: &GuildState, name: &str) -> DiscordChannel {
+        state.snapshot(now()).unwrap().channels.into_iter().find(|c| c.name == name).unwrap()
+    }
+
+    fn contents(c: &DiscordChannel) -> Vec<&str> {
+        c.messages.iter().map(|m| m.content.as_str()).collect()
+    }
+
+    /// REST shape, newest first: `ids` by user 8 with content = the offset.
+    fn page(channel: u64, offsets: impl Iterator<Item = u64>) -> Fetched {
+        let mut list: Vec<Value> = offsets.map(|o| {
+            let mut m = message(channel, R + o, 8, json!({"content": format!("m{o}")}));
+            m.as_object_mut().unwrap().remove("guild_id");
+            m
+        }).collect();
+        list.sort_by_key(|m| Reverse(snowflake(m.get("id"))));
+        Fetched::Messages(list)
+    }
+
+    fn loaded() -> GuildState {
+        let mut state = ready();
+        state.take_fetches(now());
+        state.load_history(3001, Fetched::Messages(serde_json::from_str(HISTORY_GENERAL).unwrap()), now());
+        state
+    }
+
+    #[test]
+    fn fetches_unread_channels_once_in_display_order() {
+        let mut state = ready();
+        // Before history arrives each unread channel counts as one.
+        let general = channel(&state, "general");
+        assert_eq!((general.unread, general.more, general.messages.len()), (1, false, 0));
+        // announcements is muted (listed for its mention) but unread too.
+        assert_eq!(state.take_fetches(now()), [3003, 3006, 3041, 3001, 3021]);
+        assert!(state.take_fetches(now()).is_empty());
+        // A failure is retried, but not right away.
+        assert!(!state.load_history(3003, Fetched::Failed, now()));
+        assert!(state.take_fetches(now()).is_empty());
+        assert_eq!(state.take_fetches(now() + SignedDuration::from_mins(6)), [3003]);
+        // An unreadable channel is not asked for again.
+        assert!(state.load_history(3021, Fetched::Unavailable, now()));
+        assert!(state.take_fetches(now() + SignedDuration::from_mins(60)).iter().all(|id| *id != 3021));
+    }
+
+    #[test]
+    fn history_counts_and_previews() {
+        let state = loaded();
+        let general = channel(&state, "general");
+        assert_eq!((general.unread, general.more), (1, false));
+        assert_eq!(general.messages.len(), 1);
+        let m = &general.messages[0];
+        assert_eq!(m.id, (R + 1).to_string());
+        assert_eq!(m.author, "Friend");
+        assert_eq!(m.content, "@mod look at #mods");
+        assert_eq!(m.timestamp, 1_792_670_340);
+        // Role mention of a role the user has.
+        assert!(m.mentions_me);
+    }
+
+    #[test]
+    fn cap_and_more() {
+        let mut state = ready();
+        state.take_fetches(now());
+        // mods is read up to R; a full page of unread messages R+1..=R+100.
+        assert!(state.load_history(3003, page(3003, 1..=100), now()));
+        let mods = channel(&state, "mods");
+        assert_eq!((mods.unread, mods.more), (100, true));
+        assert_eq!(contents(&mods), ["m98", "m99", "m100"]);
+
+        // A full page that reaches back to read messages is exact.
+        state.load_history(3041, page(3041, 0..100), now());
+        let joined = state.joined.unwrap();
+        assert!(R > joined);
+        let new = channel(&state, "new-no-readstate");
+        assert_eq!((new.unread, new.more), (100, true));
+        state.load_history(3021, page(3021, 0..100), now());
+        let expired = channel(&state, "expired-mute");
+        assert_eq!((expired.unread, expired.more), (99, false));
+
+        // New messages keep the count capped.
+        state.apply("MESSAGE_CREATE", &message(3003, R + 101, 8, json!({"content": "m101"})));
+        let mods = channel(&state, "mods");
+        assert_eq!((mods.unread, mods.more), (100, true));
+        assert_eq!(contents(&mods), ["m99", "m100", "m101"]);
+
+        let guild = state.snapshot(now()).unwrap();
+        // mods 100 + new 100 + general (not loaded: 1) + expired 99; the
+        // muted announcements channel is listed but not totalled.
+        assert_eq!(guild.unread_messages, 300);
+        assert!(guild.channels.iter().all(|c| c.messages.len() <= heron_core::DISCORD_PREVIEW_MESSAGES));
+    }
+
+    #[test]
+    fn live_messages_append_after_history() {
+        let mut state = loaded();
+        state.apply("MESSAGE_CREATE", &message(3001, R + 2, 8, json!({"content": "two", "member": {"nick": "Pal"}})));
+        state.apply("MESSAGE_CREATE", &message(3001, R + 3, 8, json!({"content": "three"})));
+        state.apply("MESSAGE_CREATE", &message(3001, R + 4, 66, json!({"content": "blocked"})));
+        let general = channel(&state, "general");
+        assert_eq!(general.unread, 3);
+        assert_eq!(contents(&general), ["@mod look at #mods", "two", "three"]);
+        // The nick learned from the event is used for later messages.
+        assert_eq!(general.messages[2].author, "Pal");
+        // Blocked messages leave the buffer complete: no fetch.
+        assert!(state.take_fetches(now()).iter().all(|id| *id != 3001));
+    }
+
+    #[test]
+    fn read_channel_becomes_unread_without_fetch() {
+        let mut state = ready();
+        state.apply("MESSAGE_CREATE", &message(3002, R + 20, 8, json!({"content": "<:wave:12> hi"})));
+        let rules = channel(&state, "rules");
+        assert_eq!((rules.unread, contents(&rules)), (1, vec![":wave: hi"]));
+        assert!(!state.take_fetches(now()).contains(&3002));
+    }
+
+    #[test]
+    fn reply_ping_detection() {
+        let mut state = ready();
+        let reply = |id: u64, pings: bool| {
+            message(3002, R + id, 8, json!({
+                "type": 19, "content": "reply",
+                "mentions": if pings { json!([{"id": "7", "username": "owner"}]) } else { json!([]) },
+                "message_reference": {"message_id": "5"},
+                "referenced_message": {"id": "5", "author": {"id": "7", "username": "owner"}},
+            }))
+        };
+        state.apply("MESSAGE_CREATE", &reply(1, true));
+        state.apply("MESSAGE_CREATE", &reply(2, false));
+        // @everyone is suppressed in the fixture settings.
+        state.apply("MESSAGE_CREATE", &message(3002, R + 3, 8, json!({"mention_everyone": true})));
+        let rules = channel(&state, "rules");
+        let flags: Vec<bool> = rules.messages.iter().map(|m| m.mentions_me).collect();
+        assert_eq!(flags, [true, false, false]);
+        assert_eq!(rules.mentions, 1);
+    }
+
+    #[test]
+    fn ack_trims_and_own_message_clears() {
+        let mut state = ready();
+        state.take_fetches(now());
+        state.load_history(3003, page(3003, 1..=10), now());
+        let ack = json!({"channel_id": "3003", "message_id": (R + 7).to_string(), "mention_count": 1});
+        assert!(state.apply("MESSAGE_ACK", &ack));
+        let mods = channel(&state, "mods");
+        assert_eq!((mods.unread, mods.mentions), (3, 1));
+        assert_eq!(contents(&mods), ["m8", "m9", "m10"]);
+        let ack = json!({"channel_id": "3003", "message_id": (R + 9).to_string(), "mention_count": 1});
+        state.apply("MESSAGE_ACK", &ack);
+        assert_eq!(contents(&channel(&state, "mods")), ["m10"]);
+
+        state.apply("MESSAGE_CREATE", &message(3003, R + 11, 7, json!({})));
+        assert!(!names(&state).iter().any(|(n, _)| n == "mods"));
+        assert_eq!(state.buffers[&3003].count(), (0, false));
+    }
+
+    #[test]
+    fn ack_clears_more_once_past_the_buffer() {
+        let mut state = ready();
+        state.take_fetches(now());
+        state.load_history(3003, page(3003, 1..=100), now());
+        let ack = json!({"channel_id": "3003", "message_id": (R + 50).to_string(), "mention_count": 0});
+        state.apply("MESSAGE_ACK", &ack);
+        let mods = channel(&state, "mods");
+        assert_eq!((mods.unread, mods.more), (50, false));
+    }
+
+    #[test]
+    fn manual_mark_unread_refetches() {
+        let mut state = loaded();
+        let ack = json!({"channel_id": "3001", "message_id": (R - 5).to_string(), "mention_count": 0, "manual": true});
+        assert!(state.apply("MESSAGE_ACK", &ack));
+        assert!(state.take_fetches(now()).contains(&3001));
+    }
+
+    #[test]
+    fn own_message_in_history_reads_older_ones() {
+        let mut state = ready();
+        state.take_fetches(now());
+        let Fetched::Messages(mut list) = page(3003, 1..=5) else { unreachable!() };
+        list[2]["author"]["id"] = json!("7"); // R+3
+        state.load_history(3003, Fetched::Messages(list), now());
+        assert_eq!(contents(&channel(&state, "mods")), ["m4", "m5"]);
+    }
+
+    #[test]
+    fn deletes_and_edits() {
+        let mut state = ready();
+        state.take_fetches(now());
+        state.load_history(3003, page(3003, 1..=6), now());
+        let delete = json!({"id": (R + 6).to_string(), "channel_id": "3003", "guild_id": "1000"});
+        assert!(state.apply("MESSAGE_DELETE", &delete));
+        assert!(!state.apply("MESSAGE_DELETE", &delete));
+        let bulk = json!({"ids": [(R + 1).to_string(), (R + 2).to_string(), "1"], "channel_id": "3003", "guild_id": "1000"});
+        assert!(state.apply("MESSAGE_DELETE_BULK", &bulk));
+        let mods = channel(&state, "mods");
+        assert_eq!(mods.unread, 3);
+        assert_eq!(contents(&mods), ["m4", "m5"]);
+
+        let mut edit = message(3003, R + 5, 8, json!({"content": "edited <@7>", "mentions": [{"id": "7", "username": "owner", "global_name": "Owner"}]}));
+        edit["edited_timestamp"] = json!("2026-10-22T12:01:00Z");
+        assert!(state.apply("MESSAGE_UPDATE", &edit));
+        let mods = channel(&state, "mods");
+        assert_eq!(contents(&mods), ["m4", "edited @Owner"]);
+        assert!(mods.messages[1].mentions_me);
+        // An embed-only update without content changes nothing.
+        let unfurl = json!({"id": (R + 5).to_string(), "channel_id": "3003", "guild_id": "1000", "embeds": [{}]});
+        assert!(!state.apply("MESSAGE_UPDATE", &unfurl));
+    }
+
+    #[test]
+    fn missed_messages_trigger_a_fetch() {
+        let mut state = loaded();
+        assert!(state.take_fetches(now()).iter().all(|id| *id != 3001));
+        // Discord reports a newer message we never saw (reconnect gap).
+        let update = json!({"guild_id": "1000", "channel_unread_updates": [{"id": "3001", "last_message_id": (R + 9).to_string()}]});
+        state.apply("CHANNEL_UNREAD_UPDATE", &update);
+        assert!(state.take_fetches(now()).contains(&3001));
+        // The refetch merges with what was buffered.
+        state.load_history(3001, page(3001, 1..=9), now());
+        let general = channel(&state, "general");
+        assert_eq!(general.unread, 9);
+        // Previews are the newest three of the merged buffer.
+        assert_eq!(contents(&general), ["m7", "m8", "m9"]);
     }
 }

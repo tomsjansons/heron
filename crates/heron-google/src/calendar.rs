@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use heron_core::config::{CalendarSettings, GoogleAccount};
-use heron_core::{CalendarEvent, Hub, SourceKind, SourceState};
+use heron_core::meeting::{find_meeting_url, html_to_text, meeting_url, truncate};
+use heron_core::{CalendarEvent, EventDetails, Hub, SourceKind, SourceState};
 use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp};
 use serde::Deserialize;
@@ -109,20 +110,18 @@ pub struct CalendarListEntry {
     pub summary_override: Option<String>,
     pub background_color: Option<String>,
     #[serde(default)]
-    pub selected: bool,
-    #[serde(default)]
     pub primary: bool,
 }
 
 /// The configured ids (where "primary" means the account's own calendar),
-/// or else every calendar ticked in Google Calendar's sidebar.
+/// or else only the primary calendar: shared team calendars ticked in
+/// Google Calendar's sidebar are left out unless listed.
 pub fn choose(entries: Vec<CalendarListEntry>, wanted: Option<&[String]>) -> Vec<Calendar> {
+    let primary = ["primary".to_owned()];
+    let wanted = wanted.unwrap_or(&primary);
     entries
         .into_iter()
-        .filter(|e| match wanted {
-            Some(ids) => ids.iter().any(|id| *id == e.id || (id == "primary" && e.primary)),
-            None => e.selected,
-        })
+        .filter(|e| wanted.iter().any(|id| *id == e.id || (id == "primary" && e.primary)))
         .map(|e| Calendar {
             name: e.summary_override.or(e.summary).unwrap_or_else(|| e.id.clone()),
             id: e.id,
@@ -156,6 +155,40 @@ pub struct Event {
     #[serde(default)]
     pub attendees: Vec<Attendee>,
     pub event_type: Option<String>,
+    pub description: Option<String>,
+    pub organizer: Option<Person>,
+    pub hangout_link: Option<String>,
+    pub conference_data: Option<ConferenceData>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Person {
+    pub email: Option<String>,
+    pub display_name: Option<String>,
+    #[serde(rename = "self", default)]
+    pub is_self: bool,
+}
+
+impl Person {
+    fn name(&self) -> Option<String> {
+        let name = self.display_name.as_deref().filter(|n| !n.trim().is_empty()).or(self.email.as_deref())?;
+        Some(name.trim().to_owned()).filter(|n| !n.is_empty())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConferenceData {
+    #[serde(default)]
+    pub entry_points: Vec<EntryPoint>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EntryPoint {
+    pub entry_point_type: Option<String>,
+    pub uri: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -168,10 +201,26 @@ pub struct EventTime {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Attendee {
+    pub email: Option<String>,
+    pub display_name: Option<String>,
     #[serde(rename = "self", default)]
     pub is_self: bool,
+    #[serde(default)]
+    pub organizer: bool,
+    /// Rooms and equipment.
+    #[serde(default)]
+    pub resource: bool,
     pub response_status: Option<String>,
 }
+
+/// Description characters kept in [`EventDetails`].
+const DESCRIPTION_MAX: usize = 2000;
+/// Attendees kept in [`EventDetails`].
+const ATTENDEES_MAX: usize = 30;
+
+/// Event types that block time rather than being something to attend:
+/// working-location markers, out-of-office and focus-time blocks.
+const NOT_MEETINGS: [&str; 3] = ["workingLocation", "outOfOffice", "focusTime"];
 
 /// Unix seconds and whether it is a whole day. Dates count from local midnight.
 fn parse_time(time: &EventTime, tz: &TimeZone) -> Option<(i64, bool)> {
@@ -183,8 +232,9 @@ fn parse_time(time: &EventTime, tz: &TimeZone) -> Option<(i64, bool)> {
     Some((midnight.timestamp().as_second(), true))
 }
 
-/// Maps one expanded occurrence; `None` for cancelled, declined and
-/// working-location entries.
+/// Maps one expanded occurrence; `None` for cancelled and declined events
+/// and for [`NOT_MEETINGS`]. Invitations not yet answered (`needsAction`)
+/// and tentative ones are kept: they may still be joined.
 pub fn map_event(
     source: &str,
     calendar: &Calendar,
@@ -192,7 +242,9 @@ pub fn map_event(
     palette: &HashMap<String, String>,
     tz: &TimeZone,
 ) -> Option<CalendarEvent> {
-    if event.status.as_deref() == Some("cancelled") || event.event_type.as_deref() == Some("workingLocation") {
+    if event.status.as_deref() == Some("cancelled")
+        || event.event_type.as_deref().is_some_and(|t| NOT_MEETINGS.contains(&t))
+    {
         return None;
     }
     if event.attendees.iter().any(|a| a.is_self && a.response_status.as_deref() == Some("declined")) {
@@ -202,22 +254,60 @@ pub fn map_event(
     let end = event.end.as_ref().and_then(|t| parse_time(t, tz)).map(|(t, _)| t)
         .unwrap_or(start + if all_day { 86_400 } else { 0 });
     let color = event.color_id.as_ref().and_then(|id| palette.get(id).cloned()).or_else(|| calendar.color.clone());
-    let title = event.summary.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "(No title)".into());
+    let title = event.summary.clone().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "(No title)".into());
+    let location = event.location.clone().filter(|l| !l.trim().is_empty());
+    let meeting_url = event_meeting_url(&event);
+    let details = details(&event);
     Some(CalendarEvent {
         // The same event shows up in every calendar it was shared to.
         id: format!("{}/{}", calendar.id, event.id),
         source: source.to_owned(),
         calendar: calendar.name.clone(),
         title,
-        location: event.location.filter(|l| !l.trim().is_empty()),
+        location,
         start,
         end,
         all_day,
         color,
         url: event.html_link,
-            meeting_url: None,
-            details: None,
+        meeting_url,
+        details: Some(details),
     })
+}
+
+/// Meet's `hangoutLink`, else the video entry point of the conference
+/// (Zoom, Teams and others added through Calendar add-ons), else a link
+/// found in the location or description.
+fn event_meeting_url(event: &Event) -> Option<String> {
+    let conference = event.conference_data.iter().flat_map(|c| &c.entry_points)
+        .filter(|e| e.entry_point_type.as_deref() == Some("video"))
+        .find_map(|e| e.uri.clone());
+    event.hangout_link.clone().filter(|l| !l.trim().is_empty())
+        .or(conference)
+        .or_else(|| {
+            let texts = [event.location.as_deref(), event.description.as_deref()];
+            find_meeting_url(&texts.into_iter().flatten().collect::<Vec<_>>())
+        })
+        .map(|url| meeting_url(&url).unwrap_or(url))
+}
+
+/// Description as plain text, organizer unless it is the user, and the
+/// other people invited (not the user, the organizer or rooms).
+fn details(event: &Event) -> EventDetails {
+    let description = event.description.as_deref().map(html_to_text).filter(|d| !d.is_empty())
+        .map(|d| truncate(&d, DESCRIPTION_MAX));
+    let organizer = event.organizer.as_ref().filter(|o| !o.is_self).and_then(Person::name);
+    let organizer_email = event.organizer.as_ref().and_then(|o| o.email.as_deref());
+    let attendees = event.attendees.iter()
+        .filter(|a| !a.is_self && !a.resource && !a.organizer)
+        .filter(|a| organizer_email.is_none() || a.email.as_deref() != organizer_email)
+        .filter_map(|a| {
+            let name = a.display_name.as_deref().filter(|n| !n.trim().is_empty()).or(a.email.as_deref())?;
+            Some(name.trim().to_owned())
+        })
+        .take(ATTENDEES_MAX)
+        .collect();
+    EventDetails { description, organizer, attendees }
 }
 
 struct Api {
@@ -344,14 +434,94 @@ mod tests {
          "attendees":[{"email":"boss@x.com","responseStatus":"accepted"},{"email":"me@gmail.com","self":true,"responseStatus":"declined"}]},
         {"id":"accepted","status":"confirmed","start":{"dateTime":"2026-10-25T09:00:00Z"},"end":{"dateTime":"2026-10-25T10:00:00Z"},
          "attendees":[{"email":"me@gmail.com","self":true,"responseStatus":"accepted"}]},
-        {"id":"office","eventType":"workingLocation","start":{"date":"2026-10-26"},"end":{"date":"2026-10-27"}}
+        {"id":"office","eventType":"workingLocation","start":{"date":"2026-10-26"},"end":{"date":"2026-10-27"}},
+        {"id":"ooo","eventType":"outOfOffice","summary":"Away","start":{"dateTime":"2026-10-27T09:00:00Z"},"end":{"dateTime":"2026-10-27T17:00:00Z"}},
+        {"id":"focus","eventType":"focusTime","summary":"Focus","start":{"dateTime":"2026-10-28T09:00:00Z"},"end":{"dateTime":"2026-10-28T11:00:00Z"}}
     ],"nextPageToken":null}"##;
 
+    const MEETINGS: &str = r##"{"items":[
+        {"id":"meet","status":"confirmed","summary":"Design review","eventType":"default",
+         "start":{"dateTime":"2026-10-23T12:00:00Z"},"end":{"dateTime":"2026-10-23T13:00:00Z"},
+         "hangoutLink":"https://meet.google.com/abc-defg-hij",
+         "conferenceData":{"entryPoints":[
+            {"entryPointType":"phone","uri":"tel:+1-555-0100"},
+            {"entryPointType":"video","uri":"https://meet.google.com/abc-defg-hij","label":"meet.google.com/abc-defg-hij"}],
+          "conferenceSolution":{"key":{"type":"hangoutsMeet"}}},
+         "description":"Agenda:<br><ul><li>Specs &amp; mocks</li></ul>",
+         "organizer":{"email":"lead@x.com","displayName":"Team Lead"},
+         "attendees":[
+            {"email":"lead@x.com","displayName":"Team Lead","organizer":true,"responseStatus":"accepted"},
+            {"email":"me@gmail.com","self":true,"responseStatus":"needsAction"},
+            {"email":"ann@x.com","responseStatus":"accepted"},
+            {"email":"bob@x.com","displayName":"Bob","responseStatus":"tentative"},
+            {"email":"c_123@resource.calendar.google.com","displayName":"Room 1","resource":true}]},
+        {"id":"addon","status":"confirmed","summary":"Vendor call",
+         "start":{"dateTime":"2026-10-23T14:00:00Z"},"end":{"dateTime":"2026-10-23T14:30:00Z"},
+         "conferenceData":{"entryPoints":[{"entryPointType":"video","uri":"https://us02web.zoom.us/j/8123?pwd=x"}]},
+         "organizer":{"email":"me@gmail.com","self":true}},
+        {"id":"zoom","status":"confirmed","summary":"Client sync",
+         "start":{"dateTime":"2026-10-23T15:00:00Z"},"end":{"dateTime":"2026-10-23T15:30:00Z"},
+         "description":"<p>Hi all</p><p><a href=\"https://www.google.com/url?q=https%3A%2F%2Facme.zoom.us%2Fj%2F99%3Fpwd%3Dab&amp;sa=D\">Join Zoom Meeting</a></p>",
+         "organizer":{"email":"me@gmail.com","self":true}},
+        {"id":"teams","status":"confirmed","summary":"Partner",
+         "location":"Microsoft Teams Meeting https://teams.microsoft.com/l/meetup-join/19%3ameeting_x%40thread.v2/0",
+         "start":{"dateTime":"2026-10-23T16:00:00Z"},"end":{"dateTime":"2026-10-23T16:30:00Z"}},
+        {"id":"lunch","status":"confirmed","summary":"Lunch","location":"Cafe",
+         "start":{"dateTime":"2026-10-23T11:00:00Z"},"end":{"dateTime":"2026-10-23T11:30:00Z"}}
+    ]}"##;
+
     #[test]
-    fn chooses_selected_or_configured() {
+    fn extracts_meeting_urls_and_details() {
+        let page: Page<Event> = serde_json::from_str(MEETINGS).unwrap();
+        let calendar = Calendar { id: "me@gmail.com".into(), name: "Personal".into(), color: None };
+        let tz = TimeZone::UTC;
+        let events: Vec<CalendarEvent> =
+            page.items.into_iter().filter_map(|e| map_event("p", &calendar, e, &HashMap::new(), &tz)).collect();
+        let urls: Vec<Option<&str>> = events.iter().map(|e| e.meeting_url.as_deref()).collect();
+        assert_eq!(urls, [
+            Some("https://meet.google.com/abc-defg-hij"),
+            Some("https://us02web.zoom.us/j/8123?pwd=x"),
+            Some("https://acme.zoom.us/j/99?pwd=ab"),
+            Some("https://teams.microsoft.com/l/meetup-join/19%3ameeting_x%40thread.v2/0"),
+            None,
+        ]);
+
+        // An unanswered invitation is still shown.
+        let review = events[0].details.as_ref().unwrap();
+        assert_eq!(review.description.as_deref(), Some("Agenda:\n\n- Specs & mocks"));
+        assert_eq!(review.organizer.as_deref(), Some("Team Lead"));
+        assert_eq!(review.attendees, ["ann@x.com", "Bob"]);
+
+        let vendor = events[1].details.as_ref().unwrap();
+        assert_eq!(vendor.organizer, None);
+        assert!(vendor.attendees.is_empty() && vendor.description.is_none());
+
+        let sync = events[2].details.as_ref().unwrap();
+        assert_eq!(sync.description.as_deref(), Some("Hi all\n\nJoin Zoom Meeting (https://acme.zoom.us/j/99?pwd=ab)"));
+    }
+
+    #[test]
+    fn caps_details() {
+        let attendees: Vec<String> = (0..40).map(|i| format!(r#"{{"email":"p{i}@x.com"}}"#)).collect();
+        let json = format!(
+            r#"{{"id":"big","summary":"All hands","start":{{"dateTime":"2026-10-23T12:00:00Z"}},"description":"{}","attendees":[{}]}}"#,
+            "x".repeat(3000),
+            attendees.join(",")
+        );
+        let event: Event = serde_json::from_str(&json).unwrap();
+        let calendar = Calendar { id: "c".into(), name: "C".into(), color: None };
+        let mapped = map_event("p", &calendar, event, &HashMap::new(), &TimeZone::UTC).unwrap();
+        let details = mapped.details.unwrap();
+        assert_eq!(details.attendees.len(), ATTENDEES_MAX);
+        assert_eq!(details.description.unwrap().chars().count(), DESCRIPTION_MAX + 1);
+    }
+
+    #[test]
+    fn chooses_primary_or_configured() {
         let entries = || serde_json::from_str::<Page<CalendarListEntry>>(LIST).unwrap().items;
+        // Selected shared calendars are not read unless configured.
         let names: Vec<String> = choose(entries(), None).into_iter().map(|c| c.name).collect();
-        assert_eq!(names, ["Personal", "Holidays in Latvia"]);
+        assert_eq!(names, ["Personal"]);
 
         let wanted = vec!["primary".to_owned(), "hidden@group.calendar.google.com".to_owned()];
         let ids: Vec<String> = choose(entries(), Some(&wanted)).into_iter().map(|c| c.id).collect();

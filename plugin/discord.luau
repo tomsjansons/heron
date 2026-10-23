@@ -1,8 +1,11 @@
 --!nonstrict
--- Bar widget `discord`: unread channels in the configured Discord server.
+-- Bar widget `discord`: unread messages in the configured Discord server.
 --
---   "3"      three unread channels
---   "3 @2"   ... with two mentions (glyph turns primary)
+--   "12 · @0"    twelve unread messages, none notifying you
+--   "12 · @3"    ... three of them notify you (mentions, reply pings,
+--                @everyone, roles): glyph and text turn primary
+--   "112+ · @3"  a channel has more unread than herond counts (capped at 100)
+--   "#4 · @3"    herond reports no message counts: four unread channels
 --
 -- Dims when there is nothing unread, no server is configured, or herond is not
 -- reachable. Left click toggles the channels panel; right click opens the
@@ -34,19 +37,26 @@ local function render()
     return
   end
 
-  local text = tostring(guild.unread_channels)
+  local unread = guild.unread_messages
+  local hasUnread = unread > 0 or guild.unread_channels > 0
   if guild.mentions > 0 then
-    text = text .. " @" .. guild.mentions
     barWidget.setGlyphColor("primary")
-  elseif guild.unread_channels > 0 then
-    barWidget.setGlyphColor("on_surface")
+    barWidget.setColor("primary")
   else
-    barWidget.setGlyphColor(heron.DIM_ROLE)
+    barWidget.setGlyphColor(hasUnread and "on_surface" or heron.DIM_ROLE)
+    barWidget.setColor("on_surface")
   end
-  barWidget.setText(guild.unread_channels > 0 and text or "")
+  if hasUnread then
+    -- A herond without message counts reports only channels: show "#3" then.
+    local count = unread > 0 and heron.countText(unread, guild.more) or ("#" .. guild.unread_channels)
+    barWidget.setText(count .. " · @" .. guild.mentions)
+  else
+    barWidget.setText("")
+  end
 
   local tooltip = noctalia.tr("widget.discord.tooltip", {
     name = guild.name,
+    messages = heron.countText(unread, guild.more),
     channels = guild.unread_channels,
     mentions = guild.mentions,
   })

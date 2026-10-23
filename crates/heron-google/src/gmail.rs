@@ -14,7 +14,7 @@ use async_imap::imap_proto::Address;
 use async_imap::types::Fetch;
 use futures_util::TryStreamExt as _;
 use heron_core::config::GoogleAccount;
-use heron_core::{Hub, MailCommand, MailUpdate, Message, Provider, SourceKind, SourceState};
+use heron_core::{Hub, MailCommand, MailUpdate, Message, MessageBody, Provider, SourceKind, SourceState, mailbody};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep_until, timeout};
@@ -134,8 +134,10 @@ impl Ctx<'_> {
                     let (id, seen, reply) = match command {
                         MailCommand::MarkRead { id, reply } => (id, true, reply),
                         MailCommand::MarkUnread { id, reply } => (id, false, reply),
-                        other => {
-                            other.fail(anyhow::anyhow!("not supported yet"));
+                        MailCommand::Fetch { id, reply } => {
+                            // Read state is untouched, so no refresh; a broken
+                            // connection shows up in IDLE or the next command.
+                            let _ = reply.send(fetch_body(&mut worker, &id).await);
                             continue;
                         }
                     };
@@ -343,6 +345,24 @@ fn format_from(addresses: &[Address<'_>]) -> String {
         (mailbox, host) if host.is_empty() => mailbox,
         (mailbox, host) => format!("{mailbox}@{host}"),
     }
+}
+
+/// The whole message with `BODY.PEEK[]`, which leaves the `\Seen` flag alone.
+async fn fetch_body(worker: &mut Session, id: &str) -> Result<MessageBody> {
+    let uid: u32 = id.parse().with_context(|| format!("not a Gmail message id: {id:?}"))?;
+    let fetched: Vec<Fetch> = within(async {
+        worker.uid_fetch(uid.to_string(), "(UID BODY.PEEK[])").await?.try_collect::<Vec<_>>().await
+    })
+    .await
+    .with_context(|| format!("fetching message {uid}"))?;
+    let raw = fetched.iter()
+        .find(|f| f.uid == Some(uid))
+        .and_then(Fetch::body)
+        .with_context(|| format!("message {uid} is no longer in the INBOX"))?;
+    debug!("gmail: fetched message {uid} ({} bytes)", raw.len());
+    let mut body = mailbody::from_mime(raw).with_context(|| format!("parsing message {uid}"))?;
+    body.id = id.to_owned();
+    Ok(body)
 }
 
 async fn set_seen(worker: &mut Session, id: &str, seen: bool) -> Result<()> {

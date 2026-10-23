@@ -1,8 +1,10 @@
 //! How heron presents itself: a desktop Chrome session of the Discord web
-//! client, the same fingerprint for the gateway and the one REST call.
+//! client, the same fingerprint for the gateway and the REST calls.
 //!
 //! Property names and values are adapted from concord
 //! (github.com/chojs23/concord, GPL-3.0), `src/discord/fingerprint.rs`.
+
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -51,17 +53,27 @@ pub struct User {
     pub global_name: Option<String>,
 }
 
-/// `GET /users/@me`; `Ok(None)` when Discord rejects the token.
-pub async fn current_user(token: &str) -> Result<Option<User>> {
-    let client = reqwest::Client::builder().user_agent(USER_AGENT).build()?;
-    let response = client.get(format!("{API}/users/@me"))
+/// A REST client with the web client's user agent.
+pub fn http() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder().user_agent(USER_AGENT).timeout(Duration::from_secs(30)).build()?)
+}
+
+/// A GET with the headers the web client sends, `referer` being the page
+/// the request would be made from.
+pub fn get(client: &reqwest::Client, token: &str, url: &str, referer: &str) -> reqwest::RequestBuilder {
+    client.get(url)
         .header("Authorization", token)
         .header("Accept", "*/*")
         .header("Accept-Language", "en-US,en;q=0.9")
-        .header("Referer", format!("{ORIGIN}/channels/@me"))
+        .header("Referer", referer)
         .header("Origin", ORIGIN)
         .header("X-Discord-Locale", LOCALE)
         .header("X-Super-Properties", super_properties())
+}
+
+/// `GET /users/@me`; `Ok(None)` when Discord rejects the token.
+pub async fn current_user(token: &str) -> Result<Option<User>> {
+    let response = get(&http()?, token, &format!("{API}/users/@me"), &format!("{ORIGIN}/channels/@me"))
         .send()
         .await
         .context("contacting discord.com")?;

@@ -115,6 +115,8 @@ pub async fn derive_passphrase<P: PGPProviderSync>(provider: &P, api: &Api, pass
 /// Unlocked keys of the user and of every address, by address id.
 pub struct Keyring<P: PGPProviderSync> {
     pub addresses: HashMap<String, Vec<UnlockedAddressKey<P>>>,
+    /// Every address of the account, lowercase, unlocked or not.
+    pub emails: Vec<String>,
 }
 
 impl<P: PGPProviderSync> Keyring<P> {
@@ -128,7 +130,11 @@ impl<P: PGPProviderSync> Keyring<P> {
         }
 
         let mut addresses = HashMap::new();
+        let mut emails = Vec::new();
         for address in self::addresses(api).await? {
+            if !address.email.is_empty() {
+                emails.push(address.email.to_ascii_lowercase());
+            }
             let result = AddressKeys::new(address.keys.into_iter().map(LockedKey::from))
                 .unlock(provider, &user_keys, Some(&secret));
             for failure in &result.failed {
@@ -140,6 +146,6 @@ impl<P: PGPProviderSync> Keyring<P> {
             }
             addresses.insert(address.id, result.unlocked_keys);
         }
-        Ok(Self { addresses })
+        Ok(Self { addresses, emails })
     }
 }

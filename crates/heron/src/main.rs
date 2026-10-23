@@ -38,6 +38,9 @@ enum Command {
         /// tight budgets such as the shell plugin.
         #[arg(long)]
         messages: Option<usize>,
+        /// Keep only the first N unread Discord channels (most mentions first).
+        #[arg(long)]
+        channels: Option<usize>,
     },
     /// Clear "new" for one account, or every account.
     Ack { account: Option<String> },
@@ -100,7 +103,7 @@ async fn main() -> Result<()> {
                 print_status(&snapshot);
             }
         }
-        Command::Watch { messages } => watch(messages).await?,
+        Command::Watch { messages, channels } => watch(messages, channels).await?,
         Command::Ack { account } => ok(Request::Ack { account }).await?,
         Command::MarkRead { account, id } => ok(Request::MarkRead { account, id }).await?,
         Command::MarkUnread { account, id } => ok(Request::MarkUnread { account, id }).await?,
@@ -265,13 +268,19 @@ fn print_event(event: &heron_core::CalendarEvent) {
     }
 }
 
-async fn watch(messages: Option<usize>) -> Result<()> {
+async fn watch(messages: Option<usize>, channels: Option<usize>) -> Result<()> {
     let (mut lines, _write) = connect(&Request::Watch).await?;
+    let trimming = messages.is_some() || channels.is_some();
     while let Some(line) = lines.next_line().await? {
-        match (messages, serde_json::from_str::<Response>(&line)) {
-            (Some(max), Ok(Response::Snapshot(mut snapshot))) => {
-                for account in &mut snapshot.mail {
-                    account.messages.truncate(max);
+        match serde_json::from_str::<Response>(&line) {
+            Ok(Response::Snapshot(mut snapshot)) if trimming => {
+                if let Some(max) = messages {
+                    for account in &mut snapshot.mail {
+                        account.messages.truncate(max);
+                    }
+                }
+                if let (Some(max), Some(guild)) = (channels, snapshot.discord.as_mut()) {
+                    guild.channels.truncate(max);
                 }
                 println!("{}", serde_json::to_string(&Response::Snapshot(snapshot))?);
             }

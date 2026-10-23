@@ -5,12 +5,20 @@
 #   fake-heron watch                 snapshot now, then on every change
 #   fake-heron status --json         one snapshot
 #   fake-heron ack [account]         clear "new"
-#   fake-heron mark-read ACCT ID     \  persisted in $XDG_RUNTIME_DIR/fake-heron.json,
-#   fake-heron mark-unread ACCT ID   /  so the plugin's actions round-trip
+#   fake-heron mark-read ACCT ID     \
+#   fake-heron mark-unread ACCT ID    | persisted in $XDG_RUNTIME_DIR/fake-heron.json,
+#   fake-heron mark-seen ACCT ID      | so the plugin's actions round-trip
+#   fake-heron mark-unseen ACCT ID   /
+#   fake-heron message ACCT ID --json [--max-chars N]   one message body + links
+#   fake-heron event ID --json       one calendar event with details
 #   fake-heron reload                prints nothing, exits 0
 #
-# Every 20 seconds after the first run a new message arrives, five in total. Delete
-# $XDG_RUNTIME_DIR/fake-heron.json to start over.
+# Every 20 seconds after the first run a new message arrives, five in total.
+# Touch $XDG_RUNTIME_DIR/fake-heron.quiet to stop arrivals (and the desktop
+# notifications they cause). Delete $XDG_RUNTIME_DIR/fake-heron.json to start over.
+# `message personal m4` fails like an unsupported provider, to test errors.
+# Touch $XDG_RUNTIME_DIR/fake-heron.big for 40 (or the number in it) busy Discord channels with
+# full previews (a large snapshot, for checking the sync callback's CPU budget).
 # Touch $XDG_RUNTIME_DIR/fake-heron.down to simulate a stopped daemon: running
 # watches exit and new ones fail the way the real CLI does. Remove it to recover.
 # Every invocation is logged to $XDG_RUNTIME_DIR/fake-heron.log (retry timing,
@@ -28,6 +36,8 @@ RUNTIME = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
 STATE = os.path.join(RUNTIME, "fake-heron.json")
 DOWN = os.path.join(RUNTIME, "fake-heron.down")
 LOG = os.path.join(RUNTIME, "fake-heron.log")
+QUIET = os.path.join(RUNTIME, "fake-heron.quiet")
+BIG = os.path.join(RUNTIME, "fake-heron.big")
 ARRIVAL_SECONDS = 20
 
 ARRIVALS = [
@@ -44,7 +54,8 @@ def load_state():
         with open(STATE) as f:
             return json.load(f)
     except (OSError, ValueError):
-        return {"read": [], "unread": [], "acked": {}, "started": int(time.time())}
+        return {"read": [], "unread": [], "seen": [], "unseen": [], "acked": {},
+                "started": int(time.time())}
 
 
 def save_state(state):
@@ -56,15 +67,16 @@ def save_state(state):
 
 def base_messages(now):
     return {
-        "personal": ("gmail", [
+        "personal": ("gmail", "home", [
             ("m1", "Marcin Kowalski", "Re: staging DB migration window", now - 25 * 60),
             ("m2", "Hetzner", "Server maintenance on 2026-10-30", now - 3 * 3600),
             ("m3", "Priya Nair", "Interview debrief: backend candidate", now - 26 * 3600),
             ("m4", "AWS Billing", "Your invoice for September is available", now - 4 * 86400),
         ]),
-        "proton": ("proton", [
+        "proton": ("proton", "proton", [
             ("p1", "Daniel Okafor", "Contract renewal, need your signature", now - 8 * 60),
             ("p2", "Sofia Marchetti", "Invoice #2291 attached", now - 5 * 3600),
+            ("p3", "Rust Weekly", "This Week in Rust 571: async closures, cargo-script", now - 7 * 3600),
         ]),
     }
 
@@ -74,22 +86,30 @@ def build(state):
     accounts = base_messages(state["started"])
     # Messages that "arrived" while watching land in the proton account.
     arrived = min(len(ARRIVALS), max(0, (now - state["started"]) // ARRIVAL_SECONDS))
+    if os.path.exists(QUIET):
+        # Freeze arrivals at the moment the quiet file appeared.
+        quiet_since = int(os.path.getmtime(QUIET))
+        arrived = min(arrived, max(0, (quiet_since - state["started"]) // ARRIVAL_SECONDS))
     for i in range(arrived):
         sender, subject = ARRIVALS[i]
         received = state["started"] + (i + 1) * ARRIVAL_SECONDS
-        accounts["proton"][1].insert(0, ("a%d" % i, sender, subject, received))
+        accounts["proton"][2].insert(0, ("a%d" % i, sender, subject, received))
 
     read = set(state["read"])
     forced_unread = set(state["unread"])
+    seen = set(state.get("seen", []))
+    unseen = set(state.get("unseen", []))
     mail = []
     total_new = total_unread = 0
-    for account, (provider, rows) in accounts.items():
+    for account, (provider, label, rows) in accounts.items():
         acked = state["acked"].get(account, state["started"] - 600)
         messages = []
         for mid, sender, subject, received in rows:
             key = account + "/" + mid
             unread = key not in read or key in forced_unread
-            new = unread and received > acked
+            # "new": unread, and arrived after the ack and not marked seen, or
+            # pinned by mark-unseen (which outlives an ack until marked seen).
+            new = unread and ((received > acked and key not in seen) or key in unseen)
             messages.append({
                 "id": mid, "from": sender, "subject": subject, "received": received,
                 "unread": unread, "new": new,
@@ -100,20 +120,21 @@ def build(state):
         unread = sum(1 for m in messages if m["unread"])
         total_new += new
         total_unread += unread
-        mail.append({"id": account, "provider": provider, "new": new, "unread": unread,
+        mail.append({"id": account, "label": label, "provider": provider, "new": new, "unread": unread,
                      "messages": [m for m in messages if m["unread"]] + [m for m in messages if not m["unread"]][:2]})
 
     lt = time.localtime(now)
     midnight = int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1)))
     started = state["started"]
-    soon = started - started % 60 + 9 * 60  # inside the 10 minute reminder window
+    soon = started - started % 60 + 40 * 60  # outside the 10 minute reminder window
     calendar = [
         {"id": "ev-ongoing-%d" % started, "source": "personal", "calendar": "Work", "title": "Focus block",
          "location": None, "start": started - 20 * 60, "end": started + 5 * 60, "all_day": False,
          "color": "#7986cb", "url": "https://calendar.example.com/ev-ongoing"},
         {"id": "ev-soon-%d" % started, "source": "personal", "calendar": "Work", "title": "Standup",
-         "location": "Meet", "start": soon, "end": soon + 15 * 60, "all_day": False,
-         "color": "#7986cb", "url": "https://meet.example.com/abc-defg-hij"},
+         "location": None, "start": soon, "end": soon + 15 * 60, "all_day": False,
+         "color": "#7986cb", "url": "https://calendar.example.com/ev-soon",
+         "meeting_url": "https://meet.google.com/abc-defg-hij"},
         {"id": "ev-later", "source": "proton", "calendar": "Personal", "title": "Dentist",
          "location": "Brivibas iela 1, Riga", "start": started + 3 * 3600, "end": started + 4 * 3600,
          "all_day": False, "color": "#e67c73", "url": None},
@@ -122,25 +143,21 @@ def build(state):
          "color": "#33b679", "url": None},
         {"id": "ev-tomorrow", "source": "personal", "calendar": "Work", "title": "Quarterly planning",
          "location": "Room 4", "start": midnight + 86400 + 10 * 3600, "end": midnight + 86400 + 12 * 3600,
-         "all_day": False, "color": "#7986cb", "url": "https://calendar.example.com/ev-tomorrow"},
+         "all_day": False, "color": "#7986cb", "url": "https://calendar.example.com/ev-tomorrow",
+         "meeting_url": "https://zoom.us/j/93812345678?pwd=abc"},
         {"id": "ev-week", "source": "proton", "calendar": "Personal", "title": "Flight to Berlin",
          "location": "RIX", "start": midnight + 3 * 86400 + 7 * 3600, "end": midnight + 3 * 86400 + 9 * 3600,
          "all_day": False, "color": "#e67c73", "url": None},
     ]
     calendar.sort(key=lambda e: e["start"])
 
+    for event in calendar:
+        event.setdefault("meeting_url", None)
+
     tick = (now - state["started"]) // ARRIVAL_SECONDS
-    channels = [
-        {"id": "c1", "name": "general", "mentions": 2, "url": "https://discord.com/channels/1/c1"},
-        {"id": "c2", "name": "heron-dev", "mentions": 0, "url": "https://discord.com/channels/1/c2"},
-        {"id": "c3", "name": "off-topic", "mentions": 0, "url": "https://discord.com/channels/1/c3"},
-    ]
-    if tick % 2 == 1:
-        channels.append({"id": "c4", "name": "announcements", "mentions": 1,
-                         "url": "https://discord.com/channels/1/c4"})
-    channels.sort(key=lambda c: -c["mentions"])
-    discord = {"id": "1", "name": "Rustaceans", "unread_channels": len(channels),
-               "mentions": sum(c["mentions"] for c in channels), "channels": channels}
+    if os.path.exists(QUIET):
+        tick = 1  # keep #announcements visible
+    discord = build_discord(now, tick, state["started"])
 
     sources = [
         {"id": "personal", "kind": "gmail", "state": "ok", "message": None},
@@ -153,6 +170,146 @@ def build(state):
 
     return {"type": "snapshot", "new": total_new, "unread": total_unread, "mail": mail,
             "calendar": calendar, "discord": discord, "sources": sources}
+
+
+def dmsg(mid, author, content, ago, mentions_me=False):
+    return {"id": mid, "author": author, "content": content, "timestamp": ago, "mentions_me": mentions_me}
+
+
+def build_discord(now, tick, started):
+    t = started
+    channels = [
+        {"id": "c1", "name": "general", "unread": 14, "more": False, "mentions": 2,
+         "url": "https://discord.com/channels/1/c1", "messages": [
+             dmsg("g1", "ferris", "anyone tried the new async closures on nightly?", t - 50 * 60),
+             dmsg("g2", "Mara", "@toms can you look at the heron PR before lunch? it touches the plugin", t - 12 * 60, True),
+             dmsg("g3", "Jonas", "@toms ping, the CI is red on main again [image]", t - 3 * 60, True),
+         ]},
+        {"id": "c2", "name": "heron-dev", "unread": 100, "more": True, "mentions": 0,
+         "url": "https://discord.com/channels/1/c2", "messages": [
+             dmsg("h1", "dependabot", "Bump tokio from 1.40 to 1.41", t - 2 * 3600),
+             dmsg("h2", "Lena", "pushed the inbox panel design, screenshots in the thread " + "x" * 220, t - 90 * 60),
+             dmsg("h3", "Ana", "lgtm", t - 30 * 60),
+         ]},
+        {"id": "c3", "name": "off-topic", "unread": 3, "more": False, "mentions": 0,
+         "url": "https://discord.com/channels/1/c3", "messages": [
+             dmsg("o1", "Priya", "", t - 5 * 3600),
+             dmsg("o2", "Priya", "that was the wrong channel, sorry", t - 5 * 3600 + 30),
+         ]},
+    ]
+    if tick % 2 == 1:
+        channels.append({"id": "c4", "name": "announcements", "unread": 1, "more": False, "mentions": 1,
+                         "url": "https://discord.com/channels/1/c4", "messages": [
+                             dmsg("n1", "Mod Team", "@everyone meetup on Saturday, RSVP in #events", t - 20 * 60, True),
+                         ]})
+    if os.path.exists(BIG):
+        # A busy server, for measuring the sync callback against its CPU budget.
+        try:
+            count = int(open(BIG).read().strip() or 40)
+        except (OSError, ValueError):
+            count = 40
+        for n in range(count):
+            channels.append({"id": "b%d" % n, "name": "busy-channel-%d" % n, "unread": 100, "more": True,
+                             "mentions": n % 3, "url": "https://discord.com/channels/1/b%d" % n,
+                             "messages": [dmsg("b%d-%d" % (n, k), "Someone %d" % k, ("lorem ipsum dolor sit amet " * 8)[:200],
+                                               t - k * 60, k == 0) for k in range(3)]})
+    channels.sort(key=lambda c: -c["mentions"])
+    return {"id": "1", "name": "Rustaceans", "unread_channels": len(channels),
+            "unread_messages": sum(c["unread"] for c in channels),
+            "mentions": sum(c["mentions"] for c in channels), "channels": channels}
+
+
+NEWSLETTER = """This Week in Rust 571
+
+Hello and welcome to another issue of This Week in Rust! Rust is a programming
+language empowering everyone to build reliable and efficient software.
+
+
+Updates from Rust Community
+
+* Async closures are stable — read the announcement on the Rust blog.
+* cargo-script: the RFC has been accepted, try it with cargo +nightly -Zscript.
+* Rust 2024 edition survey results are in.
+
+Crate of the Week
+
+This week's crate is heron, a tiny daemon that tells your shell bar about mail,
+calendar and Discord. Thanks to Toms for the suggestion!
+
+Call for Participation
+
+Always wanted to contribute to open-source projects but did not know where to
+start? Every week we highlight some tasks from the Rust community for you to
+pick and get started.
+
+   [ View in browser ]   [ Unsubscribe ]
+"""
+
+NEWSLETTER_LINKS = [
+    {"text": "View in browser", "url": "https://this-week-in-rust.org/blog/2026/10/22/this-week-in-rust-571/"},
+    {"text": "the announcement on the Rust blog", "url": "https://blog.rust-lang.org/2026/10/16/async-closures.html"},
+    {"text": "cargo-script RFC", "url": "https://github.com/rust-lang/rfcs/pull/3502"},
+    {"text": "survey results", "url": "https://blog.rust-lang.org/2026/10/20/edition-survey.html"},
+    {"text": "heron", "url": "https://github.com/tomsjansons/heron"},
+    {"text": "", "url": "https://this-week-in-rust.org/"},
+    {"text": "Email the editors", "url": "mailto:editors@this-week-in-rust.org"},
+    {"text": "Unsubscribe", "url": "https://this-week-in-rust.org/unsubscribe?id=1234567890abcdef1234567890abcdef"},
+]
+
+
+def message_body(state, account, mid, max_chars):
+    snap = build(state)
+    found = None
+    for acct in snap["mail"]:
+        if acct["id"] == account:
+            for m in acct["messages"]:
+                if m["id"] == mid:
+                    found = m
+    if found is None:
+        # Read messages beyond the snapshot window still resolve, by fixture.
+        for acct, (_p, _l, rows) in base_messages(state["started"]).items():
+            for row in rows:
+                if acct == account and row[0] == mid:
+                    found = {"id": mid, "from": row[1], "subject": row[2], "received": row[3]}
+    if found is None:
+        return None, "no message %s in %s" % (mid, account)
+    if account == "personal" and mid == "m4":
+        return None, "fetching message bodies is not supported for this account yet"
+    me = "toms@example.com" if account == "personal" else "toms@proton.me"
+    if mid == "p3":
+        text, links = NEWSLETTER, NEWSLETTER_LINKS
+        to, cc = [me], []
+    else:
+        text = ("Hi Toms,\n\n%s.\n\nCould you have a look when you get a chance? The details are in the "
+                "document linked below, and the meeting notes from last week are attached.\n\n"
+                "Thanks,\n%s\n\n> On Tue, you wrote:\n> Sounds good, send it over." % (found["subject"], found["from"]))
+        links = [{"text": "Shared document", "url": "https://docs.example.com/d/%s" % mid},
+                 {"text": "https://mail.example.com/%s/%s" % (account, mid), "url": "https://mail.example.com/%s/%s" % (account, mid)}]
+        to, cc = [me], (["team@example.com", "Ana Ruiz <ana@example.com>"] if mid in ("m1", "p1") else [])
+    if max_chars and len(text) > max_chars:
+        text = text[:max_chars] + "…"
+    return {"type": "message", "id": mid, "from": found["from"] + " <%s@example.com>" % found["from"].split()[0].lower(),
+            "to": to, "cc": cc, "date": found["received"], "subject": found["subject"], "text": text,
+            "links": links}, None
+
+
+EVENT_DETAILS = {
+    "ev-soon": {"description": "Daily standup. Yesterday / today / blockers.\n\nJoin with Google Meet: meet.google.com/abc-defg-hij\nOr dial: +44 20 3937 0000 PIN: 123456789#",
+                "organizer": "Ana Ruiz", "attendees": ["Toms Jansons", "Marcin Kowalski", "Lena Fischer", "priya@example.com",
+                                                       "Daniel Okafor", "Sofia Marchetti", "Jonas", "Mara", "ferris@example.com", "Hetzner Bot"]},
+    "ev-tomorrow": {"description": "Q4 planning: roadmap, hiring, budget. Bring your team's top three priorities.",
+                    "organizer": "Ana Ruiz", "attendees": ["Toms Jansons", "Lena Fischer"]},
+    "ev-later": {"description": None, "organizer": None, "attendees": []},
+}
+
+
+def event_details(state, eid):
+    for event in build(state)["calendar"]:
+        if event["id"] == eid:
+            base = eid.rsplit("-", 1)[0] if eid.startswith(("ev-soon-", "ev-ongoing-")) else eid
+            details = EVENT_DETAILS.get(base, {"description": "No agenda yet.", "organizer": "Toms Jansons", "attendees": []})
+            return dict(event, type="event", details=details), None
+    return None, "no upcoming event %s" % eid
 
 
 def daemon_down():
@@ -181,7 +338,8 @@ def main(argv):
     with open(LOG, "a") as f:
         f.write("%s %s\n" % (time.strftime("%H:%M:%S"), " ".join(argv)))
     if not argv:
-        print("usage: fake-heron watch|status --json|ack|mark-read|mark-unread|reload", file=sys.stderr)
+        print("usage: fake-heron watch|status --json|ack|mark-read|mark-unread|mark-seen|mark-unseen|"
+              "message|event|reload", file=sys.stderr)
         return 2
     cmd, args = argv[0], argv[1:]
     if cmd == "watch":
@@ -206,6 +364,38 @@ def main(argv):
             read.discard(key)
             unread.add(key)
         state["read"], state["unread"] = sorted(read), sorted(unread)
+    elif cmd in ("mark-seen", "mark-unseen") and len(args) == 2:
+        key = args[0] + "/" + args[1]
+        seen, unseen = set(state.get("seen", [])), set(state.get("unseen", []))
+        if cmd == "mark-seen":
+            seen.add(key)
+            unseen.discard(key)
+        else:
+            seen.discard(key)
+            unseen.add(key)
+        state["seen"], state["unseen"] = sorted(seen), sorted(unseen)
+    elif cmd in ("message", "event"):
+        positional, max_chars, i = [], 0, 0
+        while i < len(args):
+            if args[i] == "--max-chars" and i + 1 < len(args):
+                max_chars = int(args[i + 1])
+                i += 2
+                continue
+            if not args[i].startswith("--"):
+                positional.append(args[i])
+            i += 1
+        time.sleep(0.4)  # a provider round trip, so the loading state shows
+        if cmd == "message" and len(positional) == 2:
+            reply, err = message_body(state, positional[0], positional[1], max_chars)
+        elif cmd == "event" and len(positional) == 1:
+            reply, err = event_details(state, positional[0])
+        else:
+            reply, err = None, "usage: %s" % cmd
+        if err:
+            print(json.dumps({"type": "error", "message": err}))
+            return 1
+        print(json.dumps(reply))
+        return 0
     elif cmd == "reload":
         pass
     else:
