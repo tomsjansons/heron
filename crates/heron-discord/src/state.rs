@@ -469,7 +469,8 @@ impl GuildState {
 
     /// Edits re-render a previewed message; other edits change nothing shown.
     fn message_update(&mut self, d: &Value) -> bool {
-        if !self.is_ours(d.get("guild_id")) || d.get("content").is_none() {
+        // Partial updates carry `content`, `embeds`, or both.
+        if !self.is_ours(d.get("guild_id")) || (d.get("content").is_none() && d.get("embeds").is_none()) {
             return false;
         }
         let (Some(channel_id), Some(message_id)) = (snowflake(d.get("channel_id")), snowflake(d.get("id"))) else {
@@ -479,14 +480,25 @@ impl GuildState {
             return false;
         }
         let mentions_me = d.get("mentions").map(|_| self.mentions_me(d));
-        let content = messages::content(d, &self.names());
+        let names = self.names();
+        let content = d.get("content").map(|_| messages::content(d, &names));
+        let embeds = d.get("embeds").map(|_| messages::embeds(d, &names));
         let Some(buffer) = self.buffers.get_mut(&channel_id) else { return false };
+        let mut changed = false;
         buffer.update(message_id, |m| {
-            m.content = content;
+            let before = m.clone();
+            if let Some(content) = content {
+                m.content = content;
+            }
+            if let Some(embeds) = embeds {
+                m.embeds = embeds;
+            }
             if let Some(mentions_me) = mentions_me {
                 m.mentions_me = mentions_me;
             }
-        })
+            changed = *m != before;
+        });
+        changed
     }
 
     fn names(&self) -> Names<'_> {
@@ -1306,6 +1318,11 @@ mod tests {
         // An embed-only update without content changes nothing.
         let unfurl = json!({"id": (R + 5).to_string(), "channel_id": "3003", "guild_id": "1000", "embeds": [{}]});
         assert!(!state.apply("MESSAGE_UPDATE", &unfurl));
+        // A bot's embed arriving later shows up.
+        let rich = json!({"id": (R + 5).to_string(), "channel_id": "3003", "guild_id": "1000", "embeds": [{"title": "Alert"}]});
+        assert!(state.apply("MESSAGE_UPDATE", &rich));
+        assert_eq!(channel(&state, "mods").messages[1].embeds[0].title.as_deref(), Some("Alert"));
+        assert_eq!(contents(&channel(&state, "mods")), ["m4", "edited @Owner"]);
     }
 
     #[test]

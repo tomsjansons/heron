@@ -175,8 +175,11 @@ def build(state):
             "calendar": calendar, "discord": discord, "sources": sources}
 
 
-def dmsg(mid, author, content, ago, mentions_me=False):
-    return {"id": mid, "author": author, "content": content, "timestamp": ago, "mentions_me": mentions_me}
+def dmsg(mid, author, content, ago, mentions_me=False, embeds=None):
+    m = {"id": mid, "author": author, "content": content, "timestamp": ago, "mentions_me": mentions_me}
+    if embeds:
+        m["embeds"] = embeds
+    return m
 
 
 def build_discord(now, tick, started, read=()):
@@ -193,6 +196,16 @@ def build_discord(now, tick, started, read=()):
              dmsg("h1", "dependabot", "Bump tokio from 1.40 to 1.41", t - 2 * 3600),
              dmsg("h2", "Lena", "pushed the inbox panel design, screenshots in the thread " + "x" * 220, t - 90 * 60),
              dmsg("h3", "Ana", "lgtm", t - 30 * 60),
+         ]},
+        {"id": "c5", "name": "alerting", "unread": 2, "more": False, "mentions": 0,
+         "url": "https://discord.com/channels/1/c5", "messages": [
+             dmsg("a1", "Alertmanager", "", t - 17 * 60, embeds=[{
+                 "title": "[FIRING] CronJobLastRunFailed", "color": "#e74c3c", "url": None,
+                 "text": "warning adv: CronJob adv/device-sync did not succeed on its last run\n"
+                         "warning adv: CronJob adv/job-calc did not succeed on its last run"}]),
+             dmsg("a2", "Alertmanager", "", t - 2 * 60, embeds=[{
+                 "title": "[RESOLVED] CronJobLastRunFailed", "color": "#2ecc71", "url": None,
+                 "text": "resolved warning adv: CronJob adv/job-calc did not succeed on its last run"}]),
          ]},
         {"id": "c3", "name": "off-topic", "unread": 3, "more": False, "mentions": 0,
          "url": "https://discord.com/channels/1/c3", "messages": [

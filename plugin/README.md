@@ -65,7 +65,8 @@ publishes every snapshot; bar widgets and panels render from it.
 - `channels` - panel. Unread channels, most mentions first. Each channel header
   shows its unread count and @mentions; under it, previews of its newest unread
   messages (at most three: author, text, age), with messages that notify you
-  highlighted. Click a channel or a preview to open the channel; its check
+  highlighted. Bot embeds (alerts and the like) show their title, color and
+  text, up to ten lines. Click a channel or a preview to open the channel; its check
   button marks it read on Discord. "Mark all read" marks every listed channel
   read; "Open server" opens the whole server.
 

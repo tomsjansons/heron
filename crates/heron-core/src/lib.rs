@@ -177,6 +177,24 @@ pub struct DiscordMessage {
     pub timestamp: i64,
     /// This message notifies the user (mention, reply ping, @everyone, role).
     pub mentions_me: bool,
+    /// Rich embeds, as bots such as alerting send them, at most
+    /// [`DISCORD_PREVIEW_EMBEDS`]. Link previews are left out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub embeds: Vec<DiscordEmbed>,
+}
+
+/// Embeds kept per previewed message.
+pub const DISCORD_PREVIEW_EMBEDS: usize = 2;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct DiscordEmbed {
+    pub title: Option<String>,
+    /// Description, then one "name: value" line per field; line breaks kept,
+    /// markdown and mentions reduced to plain text, at most 400 characters.
+    pub text: String,
+    /// Hex color of the embed's side bar, such as "#e74c3c".
+    pub color: Option<String>,
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

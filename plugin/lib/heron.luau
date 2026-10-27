@@ -316,6 +316,30 @@ local DISCORD_PREVIEWS = 3
 local DISCORD_CHANNELS = 30
 local DISCORD_CONTENT_MAX = 200
 
+local DISCORD_EMBEDS = 2
+local DISCORD_EMBED_MAX = 400
+
+local function normalizeDiscordEmbeds(raw)
+  local out = {}
+  if type(raw) ~= "table" then
+    return out
+  end
+  for _, embed in ipairs(raw) do
+    if #out >= DISCORD_EMBEDS then
+      break
+    end
+    if type(embed) == "table" then
+      out[#out + 1] = {
+        title = str(embed.title) or "",
+        text = M.ellipsize(str(embed.text) or "", DISCORD_EMBED_MAX),
+        color = str(embed.color) or "",
+        url = str(embed.url) or "",
+      }
+    end
+  end
+  return out
+end
+
 local function normalizeDiscordMessages(raw)
   local out = {}
   if type(raw) ~= "table" then
@@ -332,6 +356,7 @@ local function normalizeDiscordMessages(raw)
         content = M.ellipsize(str(message.content) or "", DISCORD_CONTENT_MAX),
         timestamp = num(message.timestamp),
         mentions_me = message.mentions_me == true,
+        embeds = normalizeDiscordEmbeds(message.embeds),
       }
     end
   end

@@ -41,6 +41,10 @@ enum Command {
         /// Keep only the first N unread Discord channels (most mentions first).
         #[arg(long)]
         channels: Option<usize>,
+        /// Keep each line under N bytes by dropping Discord embeds, then
+        /// channels, from the end of the list.
+        #[arg(long)]
+        max_bytes: Option<usize>,
     },
     /// Clear "new" for one account, or every account.
     Ack { account: Option<String> },
@@ -115,7 +119,7 @@ async fn main() -> Result<()> {
                 print_status(&snapshot);
             }
         }
-        Command::Watch { messages, channels } => watch(messages, channels).await?,
+        Command::Watch { messages, channels, max_bytes } => watch(messages, channels, max_bytes).await?,
         Command::Ack { account } => ok(Request::Ack { account }).await?,
         Command::MarkRead { account, id } => ok(Request::MarkRead { account, id }).await?,
         Command::MarkUnread { account, id } => ok(Request::MarkUnread { account, id }).await?,
@@ -282,9 +286,9 @@ fn print_event(event: &heron_core::CalendarEvent) {
     }
 }
 
-async fn watch(messages: Option<usize>, channels: Option<usize>) -> Result<()> {
+async fn watch(messages: Option<usize>, channels: Option<usize>, max_bytes: Option<usize>) -> Result<()> {
     let (mut lines, _write) = connect(&Request::Watch).await?;
-    let trimming = messages.is_some() || channels.is_some();
+    let trimming = messages.is_some() || channels.is_some() || max_bytes.is_some();
     while let Some(line) = lines.next_line().await? {
         match serde_json::from_str::<Response>(&line) {
             Ok(Response::Snapshot(mut snapshot)) if trimming => {
@@ -296,12 +300,38 @@ async fn watch(messages: Option<usize>, channels: Option<usize>) -> Result<()> {
                 if let (Some(max), Some(guild)) = (channels, snapshot.discord.as_mut()) {
                     guild.channels.truncate(max);
                 }
-                println!("{}", serde_json::to_string(&Response::Snapshot(snapshot))?);
+                let mut line = serde_json::to_string(&Response::Snapshot(snapshot.clone()))?;
+                if let Some(max) = max_bytes {
+                    while line.len() >= max && shrink(&mut snapshot) {
+                        line = serde_json::to_string(&Response::Snapshot(snapshot.clone()))?;
+                    }
+                }
+                println!("{line}");
             }
             _ => println!("{line}"),
         }
     }
     Ok(())
+}
+
+/// Drops the last channel's embeds, else the last channel; false when there
+/// is nothing left to drop.
+fn shrink(snapshot: &mut Snapshot) -> bool {
+    let Some(guild) = snapshot.discord.as_mut() else { return false };
+    let with_embeds = guild.channels.iter_mut().rev()
+        .find(|c| c.messages.iter().any(|m| !m.embeds.is_empty()));
+    if let Some(channel) = with_embeds {
+        for message in &mut channel.messages {
+            if !message.embeds.is_empty() {
+                message.embeds.clear();
+                if message.content.is_empty() {
+                    message.content = "[embed]".into();
+                }
+            }
+        }
+        return true;
+    }
+    guild.channels.pop().is_some()
 }
 
 fn print_status(snapshot: &Snapshot) {

@@ -26,6 +26,9 @@ local MAX_MESSAGES = 20
 -- Discord channels requested, about 1 KB each with previews. Snapshot lines
 -- over ~65 KB reach runStream in pieces, so the total must stay well below.
 local MAX_CHANNELS = 25
+-- Bot embeds can make previews much larger; herond drops embeds (then
+-- channels) from the end of the list to keep each line under this.
+local MAX_BYTES = 48000
 local BACKOFF_MIN = 2
 local BACKOFF_MAX = 30
 local TICK_IDLE_MS = 15000
@@ -243,10 +246,11 @@ start = function()
     publish()
   end
   local script = string.format(
-    "exec 2>&1; %s watch --messages %d --channels %d & echo %s $!; wait $!; echo %s $?",
+    "exec 2>&1; %s watch --messages %d --channels %d --max-bytes %d & echo %s $!; wait $!; echo %s $?",
     heron.shellQuote(streamCommand),
     MAX_MESSAGES,
     MAX_CHANNELS,
+    MAX_BYTES,
     PID_MARK,
     EXIT_MARK
   )

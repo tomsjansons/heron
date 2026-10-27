@@ -5,8 +5,8 @@
 --
 -- Lists unread channels, most mentions first. Each channel header shows its
 -- unread count ("100+" when capped) and @mentions; under it, previews of its
--- newest unread messages (at most 3: author, text, age), with messages that
--- notify you highlighted. Clicking a channel or a preview opens the channel in
+-- newest unread messages (at most 3: author, text, bot embeds, age), with
+-- messages that notify you highlighted. Clicking a channel or a preview opens the channel in
 -- the browser (or the Discord app, if it handles discord.com links). The check
 -- button on a channel marks it read on Discord; the buttons at the bottom mark
 -- every listed channel read and open the whole server.
@@ -101,8 +101,32 @@ local function channelRow(channel)
   return ui.row(props, children)
 end
 
--- One unread message under its channel: author, content, age. Messages that
--- notify you get an @ glyph and a primary tint. Clicking opens the channel.
+-- A bot's rich embed (alerts and the like): a swatch in the embed's color, the
+-- title, and the text with its line breaks.
+local function embedBlock(embed, key)
+  local title = {
+    ui.box({ width = 8, height = 8, radius = 2, fill = embed.color ~= "" and embed.color or "on_surface/0.4" }),
+  }
+  if embed.title ~= "" then
+    title[#title + 1] = ui.label({
+      text = embed.title,
+      fontSize = 11,
+      fontWeight = "bold",
+      maxLines = 2,
+      flexGrow = 1,
+      color = "on_surface/0.9",
+    })
+  end
+  local children = { ui.row({ gap = 6, align = "center" }, title) }
+  if embed.text ~= "" then
+    children[#children + 1] = ui.label({ text = embed.text, fontSize = 11, maxLines = 10, color = "on_surface/0.75" })
+  end
+  return ui.column({ key = key, gap = 3, paddingH = 8, paddingV = 6, radius = 4, fill = "surface_variant/0.45" }, children)
+end
+
+-- One unread message under its channel: author, content, embeds, age.
+-- Messages that notify you get an @ glyph and a primary tint. Clicking opens
+-- the channel.
 local function previewRow(channel, message, now)
   local key = "msg-" .. channel.id .. "-" .. message.id
   local props = hoverFill({
@@ -120,6 +144,19 @@ local function previewRow(channel, message, now)
   if not props.fill and message.mentions_me then
     props.fill = "primary/0.10"
   end
+  local lines = {}
+  if message.content ~= "" or #message.embeds == 0 then
+    lines[#lines + 1] = ui.label({
+      text = message.content ~= "" and message.content or noctalia.tr("channels.no_text"),
+      fontSize = 11,
+      maxLines = 2,
+      color = message.content ~= "" and "on_surface/0.75" or "on_surface/0.45",
+    })
+  end
+  for index, embed in ipairs(message.embeds) do
+    lines[#lines + 1] = embedBlock(embed, key .. "-embed-" .. index)
+  end
+  local body = ui.column({ gap = 4 }, lines)
   return ui.row(props, {
     ui.glyph({
       name = message.mentions_me and "at" or "message",
@@ -142,12 +179,7 @@ local function previewRow(channel, message, now)
           color = "on_surface/0.5",
         }),
       }),
-      ui.label({
-        text = message.content ~= "" and message.content or noctalia.tr("channels.no_text"),
-        fontSize = 11,
-        maxLines = 2,
-        color = message.content ~= "" and "on_surface/0.75" or "on_surface/0.45",
-      }),
+      body,
     }),
   })
 end
