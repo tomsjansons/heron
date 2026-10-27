@@ -62,7 +62,8 @@ publishes every snapshot; bar widgets and panels render from it.
   and description (capped), with **Join** (opens the meeting link), **Copy
   link** and **Open in calendar** (the event's own link). Click again to
   collapse.
-- `channels` - panel. Unread channels, most mentions first. Each channel header
+- `channels` - panel. Unread channels and joined threads (shown as
+  `channel › thread`), most mentions first. Each channel header
   shows its unread count and @mentions; under it, previews of its newest unread
   messages (at most three: author, text, age), with messages that notify you
   highlighted. Bot embeds (alerts and the like) show their title, color and

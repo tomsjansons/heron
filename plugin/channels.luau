@@ -3,7 +3,8 @@
 --
 --   noctalia msg panel-toggle toms/heron:channels
 --
--- Lists unread channels, most mentions first. Each channel header shows its
+-- Lists unread channels and joined threads, most mentions first; a thread
+-- shows as "channel › thread" right after its channel. Each channel header shows its
 -- unread count ("100+" when capped) and @mentions; under it, previews of its
 -- newest unread messages (at most 3: author, text, bot embeds, age), with
 -- messages that notify you highlighted. Clicking a channel or a preview opens the channel in
@@ -65,17 +66,29 @@ local function channelRow(channel)
     onHover = "onRowHover",
   }, key)
 
+  -- Threads: a thread glyph, then "channel › thread" with the channel dimmed.
+  local isThread = channel.parent ~= ""
+  local nameColor = channel.mentions > 0 and "primary" or "on_surface"
+  local name = ui.label({
+    text = channel.name,
+    fontSize = 12,
+    flexGrow = 1,
+    maxLines = 1,
+    fontWeight = "bold",
+    color = nameColor,
+  })
   local children = {
-    ui.glyph({ name = "hash", size = 14, color = "on_surface/0.6" }),
-    ui.label({
-      text = channel.name,
-      fontSize = 12,
-      flexGrow = 1,
-      maxLines = 1,
-      fontWeight = "bold",
-      color = channel.mentions > 0 and "primary" or "on_surface",
-    }),
+    ui.glyph({ name = isThread and "messages" or "hash", size = 14, color = "on_surface/0.6" }),
   }
+  if isThread then
+    children[#children + 1] = ui.label({
+      text = channel.parent .. " ›",
+      fontSize = 12,
+      maxLines = 1,
+      color = "on_surface/0.55",
+    })
+  end
+  children[#children + 1] = name
   if channel.unread > 0 then
     children[#children + 1] = badge(
       noctalia.tr("channels.unread", { count = heron.countText(channel.unread, channel.more) }),

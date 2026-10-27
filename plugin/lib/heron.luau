@@ -379,6 +379,8 @@ local function normalizeDiscord(raw)
         local entry = {
           id = str(channel.id) or "",
           name = str(channel.name) or "",
+          -- Set for threads: the channel they belong to.
+          parent = str(channel.parent) or "",
           unread = num(channel.unread),
           more = channel.more == true,
           mentions = num(channel.mentions),

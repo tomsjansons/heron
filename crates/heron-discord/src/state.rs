@@ -23,6 +23,9 @@ const DISCORD_EPOCH_MS: i64 = 1_420_070_400_000;
 
 const CHANNEL_TEXT: u64 = 0;
 const CHANNEL_ANNOUNCEMENT: u64 = 5;
+const CHANNEL_ANNOUNCEMENT_THREAD: u64 = 10;
+const CHANNEL_PUBLIC_THREAD: u64 = 11;
+const CHANNEL_PRIVATE_THREAD: u64 = 12;
 const MESSAGE_POLL_RESULT: u64 = 46;
 const RELATIONSHIP_BLOCKED: u64 = 2;
 
@@ -37,7 +40,14 @@ const GUILD_UNREADS_ONLY_MENTIONS: u64 = 1 << 12;
 const GUILD_OPT_IN_CHANNELS_OFF: u64 = 1 << 13;
 const GUILD_OPT_IN_CHANNELS_ON: u64 = 1 << 14;
 
+/// Thread member notification flags; none set means "inherit".
+const THREAD_ALL_MESSAGES: u64 = 1 << 1;
+const THREAD_ONLY_MENTIONS: u64 = 1 << 2;
+const THREAD_NO_MESSAGES: u64 = 1 << 3;
+
 const NOTIFY_ALL_MESSAGES: u64 = 0;
+const NOTIFY_ONLY_MENTIONS: u64 = 1;
+const NOTIFY_NOTHING: u64 = 2;
 const NOTIFY_PARENT_DEFAULT: u64 = 3;
 
 /// A failed history fetch is retried after this long.
@@ -54,11 +64,37 @@ struct Channel {
     position: i64,
     last_message_id: Option<u64>,
     overwrites: Vec<Overwrite>,
+    /// Set for threads; `parent` is then the channel they belong to.
+    thread: Option<Thread>,
+}
+
+/// The user's side of a thread. Like the official client, only joined,
+/// active threads count as unread.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Thread {
+    joined: bool,
+    archived: bool,
+    mute: Mute,
+    /// Thread member notification flags.
+    flags: u64,
+}
+
+impl Thread {
+    /// Takes membership details from a thread member object.
+    fn join(&mut self, member: &Value) {
+        self.joined = true;
+        self.mute = Mute::parse(member);
+        self.flags = member.get("flags").and_then(Value::as_u64).unwrap_or(0);
+    }
 }
 
 impl Channel {
+    /// Text channels, and threads the user has joined that are not archived.
     fn is_text(&self) -> bool {
-        matches!(self.kind, CHANNEL_TEXT | CHANNEL_ANNOUNCEMENT)
+        match &self.thread {
+            Some(thread) => thread.joined && !thread.archived,
+            None => matches!(self.kind, CHANNEL_TEXT | CHANNEL_ANNOUNCEMENT),
+        }
     }
 }
 
@@ -172,7 +208,7 @@ struct Listed<'a> {
     unread: bool,
     /// Counts as unread (not muted, not "only mentions", opted in).
     shown: bool,
-    key: (Reverse<u32>, i64, i64, u64),
+    key: (Reverse<u32>, i64, i64, u64, u64),
 }
 
 impl GuildState {
@@ -242,7 +278,48 @@ impl GuildState {
                 self.channels.insert(channel.id, channel);
                 true
             }
-            "CHANNEL_DELETE" if self.is_ours(d.get("guild_id")) => {
+            "THREAD_CREATE" | "THREAD_UPDATE" if self.is_ours(d.get("guild_id")) => self.upsert_thread(d, false),
+            "THREAD_LIST_SYNC" if self.is_ours(d.get("guild_id")) => {
+                let members: HashMap<u64, &Value> = d.get("members").and_then(Value::as_array).into_iter().flatten()
+                    .filter(|m| snowflake(m.get("user_id")).is_none_or(|u| Some(u) == self.user_id))
+                    .filter_map(|m| Some((snowflake(m.get("id"))?, m)))
+                    .collect();
+                let mut changed = false;
+                for thread in d.get("threads").and_then(Value::as_array).into_iter().flatten() {
+                    let mut thread = thread.clone();
+                    if let Some(member) = snowflake(thread.get("id")).and_then(|id| members.get(&id)) {
+                        thread["member"] = (*member).clone();
+                    }
+                    changed |= self.upsert_thread(&thread, false);
+                }
+                changed
+            }
+            "THREAD_MEMBER_UPDATE" if self.is_ours(d.get("guild_id")) => {
+                if snowflake(d.get("user_id")).is_some_and(|u| Some(u) != self.user_id) {
+                    return false;
+                }
+                let Some(thread) = snowflake(d.get("id")).and_then(|id| self.channels.get_mut(&id)) else { return false };
+                let Some(state) = thread.thread.as_mut() else { return false };
+                let before = state.clone();
+                state.join(d);
+                *state != before
+            }
+            "THREAD_MEMBERS_UPDATE" if self.is_ours(d.get("guild_id")) => {
+                let Some(me) = self.user_id else { return false };
+                let added = d.get("added_members").and_then(Value::as_array).into_iter().flatten()
+                    .find(|m| snowflake(m.get("user_id")) == Some(me))
+                    .cloned();
+                let removed = snowflakes(d.get("removed_member_ids")).contains(&me);
+                let Some(thread) = snowflake(d.get("id")).and_then(|id| self.channels.get_mut(&id)) else { return false };
+                let Some(state) = thread.thread.as_mut() else { return false };
+                match (added, removed) {
+                    (Some(member), _) => state.join(&member),
+                    (None, true) => state.joined = false,
+                    (None, false) => return false,
+                }
+                true
+            }
+            "CHANNEL_DELETE" | "THREAD_DELETE" if self.is_ours(d.get("guild_id")) => {
                 let Some(id) = snowflake(d.get("id")) else { return false };
                 self.read_states.remove(&id);
                 self.buffers.remove(&id);
@@ -355,12 +432,16 @@ impl GuildState {
     fn supplemental(&mut self, d: &Value) -> bool {
         let guilds = d.get("guilds").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
         let Some(index) = guilds.iter().position(|g| self.is_ours(g.get("id"))) else { return false };
+        let mut changed = false;
+        for thread in guilds[index].get("threads").and_then(Value::as_array).into_iter().flatten() {
+            changed |= self.upsert_thread(thread, true);
+        }
         let Some(members) = d.pointer(&format!("/merged_members/{index}")).and_then(Value::as_array) else {
-            return false;
+            return changed;
         };
         let before = self.member_roles.clone();
         self.find_member(members);
-        before != self.member_roles
+        changed || before != self.member_roles
     }
 
     /// Takes the guild's metadata, roles and channels from a gateway guild object.
@@ -387,9 +468,37 @@ impl GuildState {
                 (c.id, c)
             })
             .collect();
+        // User accounts get only the threads they have joined here.
+        for thread in g.get("threads").and_then(Value::as_array).into_iter().flatten() {
+            self.upsert_thread(thread, true);
+        }
         if let Some(members) = g.get("members").and_then(Value::as_array) {
             self.find_member(members);
         }
+    }
+
+    /// Adds or updates a thread from a channel object, keeping membership the
+    /// payload does not mention. `joined` marks threads from lists that hold
+    /// only joined threads (READY, GUILD_CREATE).
+    fn upsert_thread(&mut self, d: &Value, joined: bool) -> bool {
+        let Some(mut channel) = parse_channel(d) else { return false };
+        let Some(thread) = channel.thread.as_mut() else { return false };
+        let old = self.channels.get(&channel.id);
+        if d.get("member").is_none() {
+            if let Some(old) = old.and_then(|c| c.thread.as_ref()) {
+                let archived = thread.archived;
+                *thread = Thread { archived, ..old.clone() };
+            }
+            thread.joined |= joined;
+        }
+        if let Some(old) = old {
+            channel.last_message_id = channel.last_message_id.max(old.last_message_id);
+        }
+        if old == Some(&channel) {
+            return false;
+        }
+        self.channels.insert(channel.id, channel);
+        true
     }
 
     fn find_member(&mut self, members: &[Value]) {
@@ -692,12 +801,25 @@ impl GuildState {
     /// Guild, channel or parent category muted, honouring mute end times.
     fn muted(&self, channel: &Channel, now: Timestamp) -> bool {
         self.settings.mute.active(now)
+            || channel.thread.as_ref().is_some_and(|t| t.mute.active(now))
             || self.ancestry(channel).any(|id| self.settings.overrides.get(&id).is_some_and(|o| o.mute.active(now)))
     }
 
-    /// The channel and its category.
+    /// The channel and its category; for a thread, the thread, its channel
+    /// and that channel's category.
     fn ancestry(&self, channel: &Channel) -> impl Iterator<Item = u64> {
-        std::iter::once(channel.id).chain(channel.parent)
+        let grandparent = channel.thread.as_ref().and(channel.parent)
+            .and_then(|p| self.channels.get(&p))
+            .and_then(|p| p.parent);
+        std::iter::once(channel.id).chain(channel.parent).chain(grandparent)
+    }
+
+    /// Permission overwrites that decide visibility: a thread's are its channel's.
+    fn overwrites<'a>(&'a self, channel: &'a Channel) -> Option<&'a [Overwrite]> {
+        match channel.thread {
+            Some(_) => channel.parent.and_then(|p| self.channels.get(&p)).map(|p| p.overwrites.as_slice()),
+            None => Some(&channel.overwrites),
+        }
     }
 
     /// Explicit "unreads: only mentions" on the channel, category or guild.
@@ -725,6 +847,12 @@ impl GuildState {
     }
 
     fn notification_level(&self, channel: &Channel) -> u64 {
+        match channel.thread.as_ref().map_or(0, |t| t.flags) {
+            flags if flags & THREAD_ALL_MESSAGES != 0 => return NOTIFY_ALL_MESSAGES,
+            flags if flags & THREAD_ONLY_MENTIONS != 0 => return NOTIFY_ONLY_MENTIONS,
+            flags if flags & THREAD_NO_MESSAGES != 0 => return NOTIFY_NOTHING,
+            _ => {}
+        }
         self.ancestry(channel)
             .filter_map(|id| self.settings.overrides.get(&id)?.message_notifications)
             .chain(self.settings.message_notifications)
@@ -746,7 +874,7 @@ impl GuildState {
         };
         let mut listed = Vec::new();
         for channel in self.channels.values().filter(|c| c.is_text()) {
-            if !member.can_view(&channel.overwrites) {
+            if !self.overwrites(channel).is_some_and(|o| member.can_view(o)) {
                 continue;
             }
             let mentions = self.read_states.get(&channel.id).map_or(0, |s| s.mentions);
@@ -755,8 +883,13 @@ impl GuildState {
             if !shown && mentions == 0 {
                 continue;
             }
-            let category = channel.parent.and_then(|p| self.channels.get(&p)).map_or(-1, |c| c.position);
-            let key = (Reverse(mentions), category, channel.position, channel.id);
+            // Threads sort right after their channel.
+            let (base, sub) = match channel.thread {
+                Some(_) => (channel.parent.and_then(|p| self.channels.get(&p)).unwrap_or(channel), channel.id),
+                None => (channel, 0),
+            };
+            let category = base.parent.and_then(|p| self.channels.get(&p)).map_or(-1, |c| c.position);
+            let key = (Reverse(mentions), category, base.position, base.id, sub);
             listed.push(Listed { channel, mentions, unread, shown, key });
         }
         listed.sort_by_key(|l| l.key);
@@ -786,6 +919,9 @@ impl GuildState {
             DiscordChannel {
                 id: id.to_string(),
                 name: l.channel.name.clone(),
+                parent: l.channel.thread.as_ref().and(l.channel.parent)
+                    .and_then(|p| self.channels.get(&p))
+                    .map(|p| p.name.clone()),
                 unread,
                 more,
                 mentions: l.mentions,
@@ -857,14 +993,26 @@ fn parse_channel(value: &Value) -> Option<Channel> {
         })
         .collect();
     let id = snowflake(value.get("id"))?;
+    let kind = value.get("type").and_then(Value::as_u64)?;
+    let thread = matches!(kind, CHANNEL_ANNOUNCEMENT_THREAD | CHANNEL_PUBLIC_THREAD | CHANNEL_PRIVATE_THREAD).then(|| {
+        let mut thread = Thread {
+            archived: value.pointer("/thread_metadata/archived").and_then(Value::as_bool).unwrap_or(false),
+            ..Thread::default()
+        };
+        if let Some(member) = value.get("member").filter(|m| !m.is_null()) {
+            thread.join(member);
+        }
+        thread
+    });
     Some(Channel {
         id,
-        kind: value.get("type").and_then(Value::as_u64)?,
+        kind,
         name: value.get("name").and_then(Value::as_str).map_or_else(|| id.to_string(), str::to_owned),
         parent: snowflake(value.get("parent_id")),
         position: value.get("position").and_then(Value::as_i64).unwrap_or(0),
         last_message_id: snowflake(value.get("last_message_id")),
         overwrites,
+        thread,
     })
 }
 
@@ -1006,6 +1154,79 @@ mod tests {
         let partial = json!({"channel_id": "3001", "message_id": R.to_string(), "mention_count": 0});
         state.apply("MESSAGE_ACK", &partial);
         assert!(names(&state).contains(&("general".into(), 0)));
+    }
+
+    fn thread(id: u64, parent: u64, name: &str, last: u64, extra: Value) -> Value {
+        let mut t = json!({
+            "id": id.to_string(), "guild_id": "1000", "type": 11, "name": name,
+            "parent_id": parent.to_string(), "last_message_id": last.to_string(),
+            "thread_metadata": {"archived": false},
+        });
+        t.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        t
+    }
+
+    #[test]
+    fn joined_threads_count_as_unread() {
+        let mut ready_json: Value = serde_json::from_str(READY).unwrap();
+        // READY lists only joined threads; 4001 is unread, 4002 is read.
+        ready_json["guilds"][1]["threads"] = json!([
+            thread(4001, 3002, "cve-pilot", R + 3, json!({})),
+            thread(4002, 3002, "read-thread", R, json!({})),
+        ]);
+        ready_json["read_state"]["entries"].as_array_mut().unwrap().extend([
+            json!({"id": "4001", "last_message_id": R.to_string(), "mention_count": 0}),
+            json!({"id": "4002", "last_message_id": R.to_string(), "mention_count": 0}),
+        ]);
+        let mut state = GuildState::new(1000);
+        state.apply("READY", &ready_json);
+        let snapshot = state.snapshot(now()).unwrap();
+        let rules = snapshot.channels.iter().position(|c| c.name == "rules");
+        let pilot = snapshot.channels.iter().position(|c| c.name == "cve-pilot").expect("joined thread listed");
+        assert_eq!(snapshot.channels[pilot].parent.as_deref(), Some("rules"));
+        assert!(rules.is_none_or(|r| r + 1 == pilot), "thread sorts after its channel");
+        assert!(!snapshot.channels.iter().any(|c| c.name == "read-thread"));
+
+        // A new thread the user has not joined stays hidden until joined.
+        assert!(state.apply("THREAD_CREATE", &thread(4003, 3001, "other", R + 5, json!({}))));
+        assert!(!names(&state).iter().any(|(n, _)| n == "other"));
+        let join = json!({"id": "4003", "guild_id": "1000", "member_count": 2,
+            "added_members": [{"id": "4003", "user_id": "7", "flags": 0}], "removed_member_ids": []});
+        assert!(state.apply("THREAD_MEMBERS_UPDATE", &join));
+        assert!(names(&state).iter().any(|(n, _)| n == "other"));
+        // An update without a member object keeps the membership.
+        assert!(state.apply("THREAD_UPDATE", &thread(4003, 3001, "renamed", R + 5, json!({}))));
+        assert!(names(&state).iter().any(|(n, _)| n == "renamed"));
+
+        // New messages arrive and are previewed like any channel's.
+        assert!(state.apply("MESSAGE_CREATE", &message(4002, R + 9, 8, json!({"content": "new in thread"}))));
+        assert!(names(&state).iter().any(|(n, _)| n == "read-thread"));
+
+        // Muting the thread hides it; mentions would still show.
+        let mute = json!({"id": "4002", "guild_id": "1000", "user_id": "7", "flags": 0, "muted": true});
+        assert!(state.apply("THREAD_MEMBER_UPDATE", &mute));
+        assert!(!names(&state).iter().any(|(n, _)| n == "read-thread"));
+
+        // Archiving hides it; leaving hides it.
+        let archived = thread(4001, 3002, "cve-pilot", R + 3, json!({"thread_metadata": {"archived": true}}));
+        assert!(state.apply("THREAD_UPDATE", &archived));
+        assert!(!names(&state).iter().any(|(n, _)| n == "cve-pilot"));
+        let leave = json!({"id": "4003", "guild_id": "1000", "member_count": 1, "removed_member_ids": ["7"]});
+        assert!(state.apply("THREAD_MEMBERS_UPDATE", &leave));
+        assert!(!names(&state).iter().any(|(n, _)| n == "renamed"));
+
+        // Threads of a channel the user cannot see stay hidden.
+        assert!(state.apply("THREAD_CREATE", &thread(4004, 3004, "secret-thread", R + 5,
+            json!({"member": {"id": "4004", "user_id": "7", "flags": 0}}))));
+        assert!(!names(&state).iter().any(|(n, _)| n == "secret-thread"));
+
+        // Marking read works on threads too.
+        assert!(state.apply("THREAD_LIST_SYNC", &json!({"guild_id": "1000", "threads": [thread(4001, 3002, "cve-pilot", R + 3, json!({}))],
+            "members": [{"id": "4001", "user_id": "7", "flags": 0}]})));
+        let targets = state.ack_targets(Some(4001), now()).unwrap();
+        assert_eq!(targets, [(4001, R + 3)]);
+        state.mark_read(&targets);
+        assert!(!names(&state).iter().any(|(n, _)| n == "cve-pilot"));
     }
 
     #[test]

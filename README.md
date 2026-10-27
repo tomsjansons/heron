@@ -15,7 +15,7 @@ been exercised against a live account yet.
 | Proton Calendar | Native Proton API, read-only. Key chain: user key → address key → calendar passphrase → calendar key → event session key. Crypto from [`proton-crypto-rs`](https://github.com/ProtonMail/proton-crypto-rs). |
 | Gmail | IMAP + IDLE with XOAUTH2. |
 | Google Calendar | Calendar API v3 with incremental sync tokens, several accounts. |
-| Discord | One server's unread channels and mentions over the gateway. Channels can be marked read (`heron discord-read`). |
+| Discord | One server's unread channels, joined threads and mentions over the gateway. Channels can be marked read (`heron discord-read`). |
 
 ## New vs unread
 

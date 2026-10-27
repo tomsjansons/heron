@@ -146,6 +146,9 @@ pub struct DiscordGuild {
 pub struct DiscordChannel {
     pub id: String,
     pub name: String,
+    /// For a thread, the name of the channel it belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
     /// Unread messages, at most [`DISCORD_UNREAD_CAP`].
     #[serde(default)]
     pub unread: u32,

@@ -207,6 +207,10 @@ def build_discord(now, tick, started, read=()):
                  "title": "[RESOLVED] CronJobLastRunFailed", "color": "#2ecc71", "url": None,
                  "text": "resolved warning adv: CronJob adv/job-calc did not succeed on its last run"}]),
          ]},
+        {"id": "t1", "name": "CVE Classification Pilot and Workflow", "parent": "heron-dev", "unread": 1,
+         "more": False, "mentions": 0, "url": "https://discord.com/channels/1/t1", "messages": [
+             dmsg("t1m", "Mara", "first batch classified, see the sheet", t - 6 * 60),
+         ]},
         {"id": "c3", "name": "off-topic", "unread": 3, "more": False, "mentions": 0,
          "url": "https://discord.com/channels/1/c3", "messages": [
              dmsg("o1", "Priya", "", t - 5 * 3600),

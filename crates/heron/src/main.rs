@@ -361,7 +361,11 @@ fn print_status(snapshot: &Snapshot) {
         );
         for channel in guild.channels.iter().take(8) {
             let mentions = if channel.mentions > 0 { format!(" @{}", channel.mentions) } else { String::new() };
-            println!("  #{}{}", channel.name, style.accent(&mentions));
+            let name = match &channel.parent {
+                Some(parent) => format!("#{parent} › {}", channel.name),
+                None => format!("#{}", channel.name),
+            };
+            println!("  {name}{}", style.accent(&mentions));
         }
     }
 
