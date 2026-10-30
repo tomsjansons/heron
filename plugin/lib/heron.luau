@@ -542,18 +542,32 @@ function M.timeRange(event)
   return M.clock(event.start) .. " – " .. M.clock(event["end"])
 end
 
--- The timed event in progress, else the next timed event starting within
--- `horizon` seconds. All-day events are skipped. Returns event, ongoing.
+-- How long an event that has started still counts as the one to join.
+M.JOIN_GRACE = 5 * 60
+
+-- The timed event to show next: one that started less than JOIN_GRACE ago,
+-- else the next to start within `horizon` seconds, else (nothing coming up)
+-- the one in progress that started last. So with overlapping meetings the bar moves on to the next
+-- one shortly after each starts. All-day events are skipped. Returns event,
+-- ongoing.
 function M.nextEvent(snapshot, now, horizon)
   if not snapshot then
     return nil, false
   end
+  local running = nil
+  -- The calendar is sorted by start.
   for _, event in ipairs(snapshot.calendar) do
-    if not event.all_day and event["end"] > now and event.start - now <= horizon then
-      return event, event.start <= now
+    if not event.all_day and event["end"] > now then
+      if event.start >= now - M.JOIN_GRACE then
+        if event.start - now <= horizon then
+          return event, event.start <= now
+        end
+        break
+      end
+      running = event
     end
   end
-  return nil, false
+  return running, running ~= nil
 end
 
 -- A JSON field that should be a string, else "".

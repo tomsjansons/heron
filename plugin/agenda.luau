@@ -1,6 +1,8 @@
 --!nonstrict
--- Bar widget `agenda`: the timed event in progress or the next one, as
--- "13:00 - Standup". All-day events are left to the calendar panel.
+-- Bar widget `agenda`: the next timed event to join, as "13:00 · Standup". An
+-- event stays for its first 5 minutes, then the next one takes over even while
+-- it runs (overlapping meetings); with nothing coming up, the one in progress
+-- shows. All-day events are left to the calendar panel.
 --
 -- With nothing in the next 24 hours the glyph dims and the text clears. The
 -- glyph turns primary while the event runs and in the 15 minutes before it.

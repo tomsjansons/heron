@@ -29,8 +29,11 @@ publishes every snapshot; bar widgets and panels render from it.
   anything shown is new, red while a shown account needs a login, and dims while
   herond is unreachable. Click toggles the `inbox` panel, opened on the widget's
   account tab when it has one.
-- `agenda` - bar widget. The timed event in progress, or the next one within 24
-  hours, as `13:00 · Standup`. All-day events are skipped (the panel shows them).
+- `agenda` - bar widget. The next timed event within 24 hours, as
+  `13:00 · Standup`. An event that has started stays for its first 5 minutes,
+  then the next one takes over even while it runs, so overlapping meetings each
+  get their turn; with nothing coming up, the one in progress shows. All-day
+  events are skipped (the panel shows them).
   Dims with no text when nothing is coming up. Click toggles the `calendar` panel.
 - `discord` - bar widget. Unread messages and the ones that notify you
   (mentions, reply pings, @everyone, roles) in the configured server: `12 · @3`.
