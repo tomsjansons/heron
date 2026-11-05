@@ -49,16 +49,36 @@ enum Command {
     /// Clear "new" for one account, or every account.
     Ack { account: Option<String> },
     /// Mark a message read on the server.
-    MarkRead { account: String, id: String },
+    MarkRead {
+        account: String,
+        #[arg(allow_hyphen_values = true)]
+        id: String,
+    },
     /// Mark a message unread on the server.
-    MarkUnread { account: String, id: String },
+    MarkUnread {
+        account: String,
+        #[arg(allow_hyphen_values = true)]
+        id: String,
+    },
     /// Move a message to the account's trash.
     #[command(alias = "delete")]
-    Trash { account: String, id: String },
+    Trash {
+        account: String,
+        #[arg(allow_hyphen_values = true)]
+        id: String,
+    },
     /// Clear "new" for one message, leaving it unread.
-    MarkSeen { account: String, id: String },
+    MarkSeen {
+        account: String,
+        #[arg(allow_hyphen_values = true)]
+        id: String,
+    },
     /// Make one message "new" again until it is marked seen.
-    MarkUnseen { account: String, id: String },
+    MarkUnseen {
+        account: String,
+        #[arg(allow_hyphen_values = true)]
+        id: String,
+    },
     /// Mark a Discord channel read on Discord, or every unread channel.
     DiscordRead {
         /// Channel id, as in `heron status --json`.
@@ -71,6 +91,8 @@ enum Command {
     /// Show a message's content without marking it read.
     Message {
         account: String,
+        /// Proton ids can start with `-`.
+        #[arg(allow_hyphen_values = true)]
         id: String,
         /// Print the message as one JSON line.
         #[arg(long)]
@@ -81,6 +103,7 @@ enum Command {
     },
     /// Show one upcoming calendar event with its details.
     Event {
+        #[arg(allow_hyphen_values = true)]
         id: String,
         #[arg(long)]
         json: bool,
